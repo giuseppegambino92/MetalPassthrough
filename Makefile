@@ -36,6 +36,7 @@ e2e: guest
 	$(CTR) -w /src/e2e $(BUILDER) sh -c '\
 	  gcc -O2 -o cuda/driver_test cuda/driver_test.c -I/usr/local/cuda/include -L/usr/local/cuda/lib64/stubs -lcuda -lm && \
 	  nvcc -O3 -cudart shared -o cuda/runtime_test cuda/runtime_test.cu && \
+	  nvcc -O3 -cudart shared -o cuda/semantics_test cuda/semantics_test.cu -lcuda && \
 	  gcc -O2 -o native/native_test native/native_test.c -I/src/guest/dist/include -L/src/guest/dist/lib -lmetalpassthrough -lm'
 
 # Regenerates the nvcc PTX fixture (CUDA 13.5 toolkit, Debian 12 arm64).
@@ -70,4 +71,4 @@ patch:
 clean:
 	swift package clean
 	rm -r guest/dist guest/apple-smi/target build 2>/dev/null || true
-	rm -f e2e/cuda/driver_test e2e/cuda/runtime_test e2e/native/native_test
+	rm -f e2e/cuda/driver_test e2e/cuda/runtime_test e2e/cuda/semantics_test e2e/native/native_test

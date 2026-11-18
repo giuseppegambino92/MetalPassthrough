@@ -14,6 +14,7 @@ __pycache__/
 # End-to-end test binaries (built by `make e2e`)
 e2e/cuda/driver_test
 e2e/cuda/runtime_test
+e2e/cuda/semantics_test
 e2e/native/native_test
 
 # Keep only the published test summary from build/

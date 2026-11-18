@@ -310,11 +310,24 @@ EXPORT cudaError_t cudaMemcpy(void *dst, const void *src, size_t n, enum cudaMem
     }
     return cudaSuccess;
 }
-EXPORT cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t n, enum cudaMemcpyKind kind, cudaStream_t s) {
-    return cudaMemcpy(dst, src, n, kind);
+EXPORT cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t n, enum cudaMemcpyKind kind, cudaStream_t st) {
+    INIT();
+    CUdeviceptr d = (CUdeviceptr)(uintptr_t)dst, s = (CUdeviceptr)(uintptr_t)src;
+    switch (kind) {
+    case cudaMemcpyHostToDevice: CU(cuMemcpyHtoDAsync(d, src, n, (CUstream)st)); break;
+    case cudaMemcpyDeviceToHost: CU(cuMemcpyDtoHAsync(dst, s, n, (CUstream)st)); break;
+    case cudaMemcpyDeviceToDevice: CU(cuMemcpyDtoDAsync(d, s, n, (CUstream)st)); break;
+    case cudaMemcpyHostToHost: CU(cuStreamSynchronize((CUstream)st)); memcpy(dst, src, n); break;
+    default: CU(cuMemcpyAsync(d, s, n, (CUstream)st)); break;
+    }
+    return cudaSuccess;
 }
 EXPORT cudaError_t cudaMemset(void *p, int v, size_t n) { INIT(); CU(cuMemsetD8((CUdeviceptr)(uintptr_t)p, (unsigned char)v, n)); return cudaSuccess; }
-EXPORT cudaError_t cudaMemsetAsync(void *p, int v, size_t n, cudaStream_t s) { return cudaMemset(p, v, n); }
+EXPORT cudaError_t cudaMemsetAsync(void *p, int v, size_t n, cudaStream_t s) {
+    INIT();
+    CU(cuMemsetD8Async((CUdeviceptr)(uintptr_t)p, (unsigned char)v, n, (CUstream)s));
+    return cudaSuccess;
+}
 EXPORT cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *a, const void *ptr) {
     INIT();
     memset(a, 0, sizeof *a);
@@ -333,15 +346,27 @@ EXPORT cudaError_t cudaStreamCreate(cudaStream_t *s) { INIT(); CU(cuStreamCreate
 EXPORT cudaError_t cudaStreamCreateWithFlags(cudaStream_t *s, unsigned int f) { INIT(); CU(cuStreamCreate((CUstream *)s, f)); return cudaSuccess; }
 EXPORT cudaError_t cudaStreamDestroy(cudaStream_t s) { CU(cuStreamDestroy((CUstream)s)); return cudaSuccess; }
 EXPORT cudaError_t cudaStreamSynchronize(cudaStream_t s) { INIT(); CU(cuStreamSynchronize((CUstream)s)); return cudaSuccess; }
-EXPORT cudaError_t cudaStreamQuery(cudaStream_t s) { INIT(); CU(cuStreamQuery((CUstream)s)); return cudaSuccess; }
-EXPORT cudaError_t cudaStreamWaitEvent(cudaStream_t s, cudaEvent_t e, unsigned int f) { return cudaSuccess; }
+EXPORT cudaError_t cudaStreamQuery(cudaStream_t s) {
+    INIT();
+    CUresult r = cuStreamQuery((CUstream)s);  /* never blocks; NotReady is not a sticky error */
+    return r == CUDA_ERROR_NOT_READY ? cudaErrorNotReady : ret(from_cu(r));
+}
+EXPORT cudaError_t cudaStreamWaitEvent(cudaStream_t s, cudaEvent_t e, unsigned int f) {
+    INIT();
+    CU(cuStreamWaitEvent((CUstream)s, (CUevent)e, f));
+    return cudaSuccess;
+}
 EXPORT cudaError_t cudaEventCreate(cudaEvent_t *e) { INIT(); CU(cuEventCreate((CUevent *)e, 0)); return cudaSuccess; }
 EXPORT cudaError_t cudaEventCreateWithFlags(cudaEvent_t *e, unsigned int f) { INIT(); CU(cuEventCreate((CUevent *)e, f)); return cudaSuccess; }
 EXPORT cudaError_t cudaEventDestroy(cudaEvent_t e) { CU(cuEventDestroy((CUevent)e)); return cudaSuccess; }
 EXPORT cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t s) { INIT(); CU(cuEventRecord((CUevent)e, (CUstream)s)); return cudaSuccess; }
 EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) { INIT(); CU(cuEventSynchronize((CUevent)e)); return cudaSuccess; }
 EXPORT cudaError_t cudaEventQuery(cudaEvent_t e) { CUresult r = cuEventQuery((CUevent)e); return r == CUDA_ERROR_NOT_READY ? cudaErrorNotReady : from_cu(r); }
-EXPORT cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t a, cudaEvent_t b) { INIT(); CU(cuEventElapsedTime(ms, (CUevent)a, (CUevent)b)); return cudaSuccess; }
+EXPORT cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t a, cudaEvent_t b) {
+    INIT();
+    CUresult r = cuEventElapsedTime(ms, (CUevent)a, (CUevent)b);
+    return r == CUDA_ERROR_NOT_READY ? cudaErrorNotReady : ret(from_cu(r));
+}
 
 /* ------------------------------------------------------------------ errors */
 

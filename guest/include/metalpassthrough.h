@@ -63,6 +63,10 @@ MPT_API size_t mpt_alloc_size(mpt_ctx *ctx, const void *ptr);
 MPT_API uint64_t mpt_devaddr(mpt_ctx *ctx, const void *ptr);       /* 0 if not arena memory */
 MPT_API void *mpt_hostptr(mpt_ctx *ctx, uint64_t devaddr);         /* NULL if unknown */
 MPT_API int mpt_memory_info(mpt_ctx *ctx, uint64_t *free_bytes, uint64_t *total_bytes);
+/* Allocation containing ptr (interior pointers allowed): its base and size. MPT_ENOENT if none. */
+MPT_API int mpt_alloc_lookup(mpt_ctx *ctx, const void *ptr, void **base, size_t *size);
+/* 0 if [ptr, ptr + n) lies entirely inside one live allocation, MPT_EFAULT otherwise (overflow-safe). */
+MPT_API int mpt_check_range(mpt_ctx *ctx, const void *ptr, size_t n);
 
 /* Pipelines. log may be NULL. */
 MPT_API int mpt_compile_msl(mpt_ctx *ctx, const char *source, const char *function, uint32_t flags,
@@ -84,9 +88,28 @@ MPT_API int mpt_flush(mpt_ctx *ctx);
 MPT_API int mpt_sync(mpt_ctx *ctx, uint64_t *gpu_ns);
 MPT_API int mpt_pending(mpt_ctx *ctx);   /* 1 if work was submitted since the last sync */
 
+/* Streams. Stream 0 is the legacy default stream: it implicitly synchronizes with every
+ * blocking stream (CUDA semantics). Streams are independent Metal queues and run concurrently. */
+MPT_API int mpt_stream_create(mpt_ctx *ctx, uint32_t flags /* MPT_STREAM_NON_BLOCKING */, uint32_t *stream);
+MPT_API int mpt_stream_destroy(mpt_ctx *ctx, uint32_t stream);
+MPT_API int mpt_stream_sync(mpt_ctx *ctx, uint32_t stream, uint64_t *gpu_ns);
+/* Never blocks: 1 if all work submitted to the stream has completed, 0 if not, < 0 on error. */
+MPT_API int mpt_stream_query(mpt_ctx *ctx, uint32_t stream);
+MPT_API int mpt_dispatch_on(mpt_ctx *ctx, uint32_t stream, const mpt_pipeline *p, const uint32_t grid[3], const uint32_t tg[3],
+                            uint32_t mode, const mpt_arg *args, uint32_t nargs, uint32_t flags);
+MPT_API int mpt_dispatch_raw_on(mpt_ctx *ctx, uint32_t stream, const mpt_pipeline *p, const uint32_t grid[3],
+                                const uint32_t tg[3], const void *params, uint32_t params_len, uint32_t tg_memory, uint32_t flags);
+MPT_API int mpt_copy_on(mpt_ctx *ctx, uint32_t stream, uint64_t dst_dev, uint64_t src_dev, uint64_t len);
+MPT_API int mpt_fill_on(mpt_ctx *ctx, uint32_t stream, uint64_t dst_dev, uint64_t len, uint32_t pattern, uint32_t width);
+
 /* GPU timestamp events (ev must be arena memory, e.g. from mpt_alloc). */
-MPT_API int mpt_event_record(mpt_ctx *ctx, mpt_event *ev);
+MPT_API int mpt_event_record(mpt_ctx *ctx, mpt_event *ev);             /* on stream 0 */
+MPT_API int mpt_event_record_on(mpt_ctx *ctx, uint32_t stream, mpt_event *ev);
+/* Later work on `stream` waits (on the GPU) for the event's most recent record; no-op if never recorded. */
+MPT_API int mpt_stream_wait_event(mpt_ctx *ctx, uint32_t stream, const mpt_event *ev);
+MPT_API int mpt_event_query(mpt_ctx *ctx, const mpt_event *ev);        /* 1 done, 0 pending; never blocks */
 MPT_API int mpt_event_wait(mpt_ctx *ctx, mpt_event *ev);
+MPT_API int mpt_event_destroy(mpt_ctx *ctx, mpt_event *ev);
 
 #ifdef __cplusplus
 }

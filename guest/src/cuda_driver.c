@@ -31,7 +31,7 @@ struct CUfunc_st {
     int max_dynamic_shared;
 };
 struct CUmod_st { char *ptx; struct CUfunc_st *funcs; };
-struct CUstream_st { unsigned flags; int priority; };
+struct CUstream_st { unsigned flags; int priority; uint32_t id; };
 struct CUevent_st { mpt_event *ev; unsigned flags; int recorded; };
 
 static struct CUctx_st g_primary = { 0, 0 };
@@ -232,18 +232,58 @@ EXPORT CUresult cuCtxGetCacheConfig(CUfunc_cache *c) { *c = CU_FUNC_CACHE_PREFER
 EXPORT CUresult cuCtxSetLimit(CUlimit l, size_t v) { return CUDA_SUCCESS; }
 EXPORT CUresult cuCtxGetLimit(size_t *v, CUlimit l) { *v = 0; return CUDA_SUCCESS; }
 
+static void reap_staging(int wait);
 EXPORT CUresult cuCtxSynchronize(void) {
     REQUIRE_INIT();
-    return map_err(mpt_sync(g, NULL));
+    CUresult r = map_err(mpt_sync(g, NULL));
+    reap_staging(0);
+    return r;
 }
 
 /* ------------------------------------------------------------------ memory */
 
 static inline void *hp(CUdeviceptr d) { return mpt_hostptr(g, (uint64_t)d); }
 
-/* Device memory is the guest's own unified memory: host<->device copies are CPU memcpy, ordered
- * after outstanding GPU work (synchronous CUDA copy semantics). */
+/* Stream handle -> MetalPassthrough stream id. NULL, CU_STREAM_LEGACY and CU_STREAM_PER_THREAD
+ * all map to the legacy default stream (0). */
+static inline uint32_t sid(CUstream s) {
+    return (s == NULL || s == CU_STREAM_LEGACY || s == CU_STREAM_PER_THREAD) ? 0u : s->id;
+}
+
+/* Device range [d, d + n) must lie inside one live allocation (overflow-safe). */
+static void *dev_range(CUdeviceptr d, size_t n) {
+    void *p = hp(d);
+    if (!p || (n && mpt_check_range(g, p, n) != 0)) return NULL;
+    return p;
+}
+
+/* Synchronous copies run on the legacy default stream: they are ordered after all outstanding
+ * work in blocking streams (device-wide sync is a superset of that). */
 static CUresult settle(void) { return mpt_pending(g) ? map_err(mpt_sync(g, NULL)) : CUDA_SUCCESS; }
+
+/* Staging buffers for asynchronous copies from pageable memory, freed once their stream passed
+ * the recorded event. */
+typedef struct staging { struct staging *next; void *buf; mpt_event *ev; } staging;
+static staging *g_staging;
+static pthread_mutex_t g_staging_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void reap_staging(int wait) {
+    pthread_mutex_lock(&g_staging_lock);
+    for (staging **pp = &g_staging; *pp;) {
+        staging *st = *pp;
+        if (wait) mpt_event_wait(g, st->ev);
+        if (mpt_event_query(g, st->ev)) {
+            *pp = st->next;
+            mpt_event_destroy(g, st->ev);
+            mpt_free(g, st->ev);
+            mpt_free(g, st->buf);
+            free(st);
+        } else {
+            pp = &st->next;
+        }
+    }
+    pthread_mutex_unlock(&g_staging_lock);
+}
 
 EXPORT CUresult cuMemAlloc(CUdeviceptr *dptr, size_t bytes) {
     REQUIRE_INIT();
@@ -255,7 +295,9 @@ EXPORT CUresult cuMemAlloc(CUdeviceptr *dptr, size_t bytes) {
 }
 
 EXPORT CUresult cuMemAllocPitch(CUdeviceptr *dptr, size_t *pitch, size_t w, size_t h, unsigned int elem) {
+    if (!pitch || w > ((size_t)1 << 40) || h > ((size_t)1 << 40)) return CUDA_ERROR_INVALID_VALUE;
     size_t p = (w + 255) & ~(size_t)255;
+    if (h && p > SIZE_MAX / h) return CUDA_ERROR_INVALID_VALUE;
     *pitch = p;
     return cuMemAlloc(dptr, p * h);
 }
@@ -264,7 +306,9 @@ EXPORT CUresult cuMemFree(CUdeviceptr dptr) {
     REQUIRE_INIT();
     if (!dptr) return CUDA_SUCCESS;
     void *p = hp(dptr);
-    if (!p) return CUDA_ERROR_INVALID_VALUE;
+    void *base;
+    size_t sz;
+    if (!p || mpt_alloc_lookup(g, p, &base, &sz) != 0 || base != p) return CUDA_ERROR_INVALID_VALUE;
     CUresult r = settle();  /* never recycle memory the GPU may still touch */
     mpt_free(g, p);
     return r;
@@ -281,11 +325,10 @@ EXPORT CUresult cuMemGetInfo(size_t *free_b, size_t *total_b) {
 
 EXPORT CUresult cuMemGetAddressRange(CUdeviceptr *base, size_t *size, CUdeviceptr dptr) {
     REQUIRE_INIT();
-    void *p = hp(dptr);
-    if (!p) return CUDA_ERROR_NOT_FOUND;
-    size_t s = mpt_alloc_size(g, p);
-    if (!s) return CUDA_ERROR_NOT_FOUND;  /* only exact allocation bases are tracked */
-    if (base) *base = dptr;
+    void *p = hp(dptr), *b;
+    size_t s;
+    if (!p || mpt_alloc_lookup(g, p, &b, &s) != 0) return CUDA_ERROR_NOT_FOUND;  /* interior pointers allowed */
+    if (base) *base = (CUdeviceptr)mpt_devaddr(g, b);
     if (size) *size = s;
     return CUDA_SUCCESS;
 }
@@ -293,18 +336,27 @@ EXPORT CUresult cuMemGetAddressRange(CUdeviceptr *base, size_t *size, CUdevicept
 /* Pinned / mapped / managed host memory: arena memory is simultaneously host- and GPU-visible. */
 EXPORT CUresult cuMemAllocHost(void **pp, size_t bytes) {
     REQUIRE_INIT();
+    if (!pp) return CUDA_ERROR_INVALID_VALUE;
     void *p = mpt_alloc(g, bytes ? bytes : 1, 256);
     if (!p) return CUDA_ERROR_OUT_OF_MEMORY;
     *pp = p;
     return CUDA_SUCCESS;
 }
 EXPORT CUresult cuMemHostAlloc(void **pp, size_t bytes, unsigned int flags) { return cuMemAllocHost(pp, bytes); }
-EXPORT CUresult cuMemFreeHost(void *p) { REQUIRE_INIT(); CUresult r = settle(); mpt_free(g, p); return r; }
+EXPORT CUresult cuMemFreeHost(void *p) {
+    REQUIRE_INIT();
+    void *b;
+    size_t s;
+    if (!p) return CUDA_SUCCESS;
+    if (mpt_alloc_lookup(g, p, &b, &s) != 0 || b != p) return CUDA_ERROR_INVALID_VALUE;
+    CUresult r = settle();
+    mpt_free(g, p);
+    return r;
+}
 EXPORT CUresult cuMemHostGetDevicePointer(CUdeviceptr *d, void *p, unsigned int flags) {
     REQUIRE_INIT();
-    uint64_t a = mpt_devaddr(g, p);
-    if (!a) return CUDA_ERROR_INVALID_VALUE;
-    *d = (CUdeviceptr)a;
+    if (!d || !p || mpt_check_range(g, p, 1) != 0) return CUDA_ERROR_INVALID_VALUE;
+    *d = (CUdeviceptr)mpt_devaddr(g, p);
     return CUDA_SUCCESS;
 }
 EXPORT CUresult cuMemHostGetFlags(unsigned int *flags, void *p) { *flags = CU_MEMHOSTALLOC_DEVICEMAP; return CUDA_SUCCESS; }
@@ -315,29 +367,89 @@ EXPORT CUresult cuMemAllocManaged(CUdeviceptr *dptr, size_t bytes, unsigned int 
 }
 EXPORT CUresult cuMemHostRegister(void *p, size_t bytes, unsigned int flags) {
     /* Arbitrary guest pages are not physically contiguous 2 MiB hugepages: cannot be GPU-mapped. */
-    return mpt_devaddr(g, p) ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
+    return mpt_check_range(g, p, bytes) == 0 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
 }
 EXPORT CUresult cuMemHostUnregister(void *p) { return CUDA_SUCCESS; }
 
 EXPORT CUresult cuMemcpyHtoD(CUdeviceptr dst, const void *src, size_t n) {
     REQUIRE_INIT();
-    void *d = hp(dst);
-    if (!d) return CUDA_ERROR_INVALID_VALUE;
+    if (!n) return CUDA_SUCCESS;
+    void *d = dev_range(dst, n);
+    if (!d || !src) return CUDA_ERROR_INVALID_VALUE;
     CUresult r = settle();
     memcpy(d, src, n);
     return r;
 }
 EXPORT CUresult cuMemcpyDtoH(void *dst, CUdeviceptr src, size_t n) {
     REQUIRE_INIT();
-    void *s = hp(src);
-    if (!s) return CUDA_ERROR_INVALID_VALUE;
+    if (!n) return CUDA_SUCCESS;
+    void *s = dev_range(src, n);
+    if (!s || !dst) return CUDA_ERROR_INVALID_VALUE;
     CUresult r = settle();
     memcpy(dst, s, n);
     return r;
 }
-EXPORT CUresult cuMemcpyDtoD(CUdeviceptr dst, CUdeviceptr src, size_t n) {
+EXPORT CUresult cuMemcpyDtoDAsync(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream st) {
     REQUIRE_INIT();
-    return map_err(mpt_copy(g, dst, src, n));  /* GPU blit, stream ordered */
+    if (!n) return CUDA_SUCCESS;
+    if (!dev_range(dst, n) || !dev_range(src, n)) return CUDA_ERROR_INVALID_VALUE;
+    return map_err(mpt_copy_on(g, sid(st), dst, src, n));  /* GPU blit, stream ordered */
+}
+EXPORT CUresult cuMemcpyDtoD(CUdeviceptr dst, CUdeviceptr src, size_t n) { return cuMemcpyDtoDAsync(dst, src, n, NULL); }
+
+/* Host->device, stream ordered. Pinned (arena) sources are copied by the GPU asynchronously.
+ * Pageable sources are staged synchronously into arena memory and then blitted, which is exactly
+ * the CUDA contract for pageable cuMemcpyHtoDAsync. */
+EXPORT CUresult cuMemcpyHtoDAsync(CUdeviceptr dst, const void *src, size_t n, CUstream st) {
+    REQUIRE_INIT();
+    if (!n) return CUDA_SUCCESS;
+    if (!dev_range(dst, n) || !src) return CUDA_ERROR_INVALID_VALUE;
+    reap_staging(0);
+    if (mpt_check_range(g, src, n) == 0) return map_err(mpt_copy_on(g, sid(st), dst, mpt_devaddr(g, src), n));
+    void *buf = mpt_alloc(g, n, 256);
+    mpt_event *ev = buf ? mpt_alloc(g, sizeof(mpt_event), 256) : NULL;
+    if (!buf || !ev) {  /* no staging space: fall back to a synchronous copy (still correct) */
+        if (buf) mpt_free(g, buf);
+        CUresult r = map_err(mpt_stream_sync(g, sid(st), NULL));
+        if (r == CUDA_SUCCESS) r = cuMemcpyHtoD(dst, src, n);
+        return r;
+    }
+    memcpy(buf, src, n);
+    int rc = mpt_copy_on(g, sid(st), dst, mpt_devaddr(g, buf), n);
+    if (!rc) rc = mpt_event_record_on(g, sid(st), ev);
+    staging *sg = malloc(sizeof *sg);
+    sg->buf = buf;
+    sg->ev = ev;
+    pthread_mutex_lock(&g_staging_lock);
+    sg->next = g_staging;
+    g_staging = sg;
+    pthread_mutex_unlock(&g_staging_lock);
+    return map_err(rc);
+}
+
+/* Device->host, stream ordered. Pinned (arena) destinations: asynchronous GPU blit. Pageable
+ * destinations: the call returns once the copy has completed (CUDA's pageable contract). */
+EXPORT CUresult cuMemcpyDtoHAsync(void *dst, CUdeviceptr src, size_t n, CUstream st) {
+    REQUIRE_INIT();
+    if (!n) return CUDA_SUCCESS;
+    void *s = dev_range(src, n);
+    if (!s || !dst) return CUDA_ERROR_INVALID_VALUE;
+    if (mpt_check_range(g, dst, n) == 0) return map_err(mpt_copy_on(g, sid(st), mpt_devaddr(g, dst), src, n));
+    CUresult r = map_err(mpt_stream_sync(g, sid(st), NULL));
+    memcpy(dst, s, n);
+    return r;
+}
+
+EXPORT CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream st) {
+    REQUIRE_INIT();
+    int dd = hp(dst) != NULL, sd = hp(src) != NULL;
+    if (dd && sd) return cuMemcpyDtoDAsync(dst, src, n, st);
+    if (dd) return cuMemcpyHtoDAsync(dst, (const void *)(uintptr_t)src, n, st);
+    if (sd) return cuMemcpyDtoHAsync((void *)(uintptr_t)dst, src, n, st);
+    if (!dst || !src) return CUDA_ERROR_INVALID_VALUE;
+    CUresult r = map_err(mpt_stream_sync(g, sid(st), NULL));
+    memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
+    return r;
 }
 EXPORT CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t n) {
     REQUIRE_INIT();
@@ -345,19 +457,24 @@ EXPORT CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t n) {
     if (dd && sd) return cuMemcpyDtoD(dst, src, n);
     if (dd) return cuMemcpyHtoD(dst, (const void *)(uintptr_t)src, n);
     if (sd) return cuMemcpyDtoH((void *)(uintptr_t)dst, src, n);
+    if (!dst || !src) return CUDA_ERROR_INVALID_VALUE;
     memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
     return CUDA_SUCCESS;
 }
-EXPORT CUresult cuMemcpyHtoDAsync(CUdeviceptr dst, const void *src, size_t n, CUstream s) { return cuMemcpyHtoD(dst, src, n); }
-EXPORT CUresult cuMemcpyDtoHAsync(void *dst, CUdeviceptr src, size_t n, CUstream s) { return cuMemcpyDtoH(dst, src, n); }
-EXPORT CUresult cuMemcpyDtoDAsync(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream s) { return cuMemcpyDtoD(dst, src, n); }
-EXPORT CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream s) { return cuMemcpy(dst, src, n); }
 
-EXPORT CUresult cuMemsetD8(CUdeviceptr d, unsigned char v, size_t n) { REQUIRE_INIT(); return map_err(mpt_fill(g, d, n, v, 1)); }
-EXPORT CUresult cuMemsetD16(CUdeviceptr d, unsigned short v, size_t n) { REQUIRE_INIT(); return map_err(mpt_fill(g, d, n * 2, v, 2)); }
-EXPORT CUresult cuMemsetD32(CUdeviceptr d, unsigned int v, size_t n) { REQUIRE_INIT(); return map_err(mpt_fill(g, d, n * 4, v, 4)); }
-EXPORT CUresult cuMemsetD8Async(CUdeviceptr d, unsigned char v, size_t n, CUstream s) { return cuMemsetD8(d, v, n); }
-EXPORT CUresult cuMemsetD32Async(CUdeviceptr d, unsigned int v, size_t n, CUstream s) { return cuMemsetD32(d, v, n); }
+static CUresult memset_on(CUdeviceptr d, uint32_t v, size_t n, uint32_t width, CUstream st) {
+    REQUIRE_INIT();
+    if (!n) return CUDA_SUCCESS;
+    if (n > SIZE_MAX / width || (d % width) != 0) return CUDA_ERROR_INVALID_VALUE;
+    if (!dev_range(d, n * width)) return CUDA_ERROR_INVALID_VALUE;
+    return map_err(mpt_fill_on(g, sid(st), d, n * width, v, width));
+}
+EXPORT CUresult cuMemsetD8(CUdeviceptr d, unsigned char v, size_t n) { return memset_on(d, v, n, 1, NULL); }
+EXPORT CUresult cuMemsetD16(CUdeviceptr d, unsigned short v, size_t n) { return memset_on(d, v, n, 2, NULL); }
+EXPORT CUresult cuMemsetD32(CUdeviceptr d, unsigned int v, size_t n) { return memset_on(d, v, n, 4, NULL); }
+EXPORT CUresult cuMemsetD8Async(CUdeviceptr d, unsigned char v, size_t n, CUstream s) { return memset_on(d, v, n, 1, s); }
+EXPORT CUresult cuMemsetD16Async(CUdeviceptr d, unsigned short v, size_t n, CUstream s) { return memset_on(d, v, n, 2, s); }
+EXPORT CUresult cuMemsetD32Async(CUdeviceptr d, unsigned int v, size_t n, CUstream s) { return memset_on(d, v, n, 4, s); }
 
 EXPORT CUresult cuPointerGetAttribute(void *data, CUpointer_attribute a, CUdeviceptr ptr) {
     REQUIRE_INIT();
@@ -553,27 +670,56 @@ EXPORT CUresult cuLaunchKernel(CUfunction f, unsigned gx, unsigned gy, unsigned 
     uint32_t tgmem = (f->info.flags & MPT_KF_USES_SHARED) ? f->info.shared_bytes + shmem : 0;
     if (tgmem > mpt_device(g)->threadgroup_memory) return CUDA_ERROR_INVALID_VALUE;
     uint32_t grid[3] = { gx, gy, gz }, tg[3] = { bx, by, bz };
-    return map_err(mpt_dispatch_raw(g, &f->pipe, grid, tg, block, len, tgmem, 0));
+    return map_err(mpt_dispatch_raw_on(g, sid(stream), &f->pipe, grid, tg, block, len, tgmem, 0));
 }
 
 /* ------------------------------------------------------------------ streams & events */
 
+/* Each CUstream is an independent Metal command queue on the host (real concurrency). The NULL
+ * stream is the legacy default stream: it synchronizes with all blocking streams. */
 EXPORT CUresult cuStreamCreate(CUstream *s, unsigned int flags) {
     REQUIRE_INIT();
+    if (!s) return CUDA_ERROR_INVALID_VALUE;
     struct CUstream_st *st = calloc(1, sizeof *st);
     st->flags = flags;
+    int r = mpt_stream_create(g, (flags & CU_STREAM_NON_BLOCKING) ? MPT_STREAM_NON_BLOCKING : 0, &st->id);
+    if (r) { free(st); return map_err(r); }
     *s = st;
     return CUDA_SUCCESS;
 }
 EXPORT CUresult cuStreamCreateWithPriority(CUstream *s, unsigned int flags, int prio) { return cuStreamCreate(s, flags); }
-/* All streams execute in submission order on the session's single Metal queue (stricter than CUDA). */
-EXPORT CUresult cuStreamDestroy(CUstream s) { free(s); return CUDA_SUCCESS; }
-EXPORT CUresult cuStreamSynchronize(CUstream s) { REQUIRE_INIT(); return map_err(mpt_sync(g, NULL)); }
-EXPORT CUresult cuStreamQuery(CUstream s) { REQUIRE_INIT(); return mpt_pending(g) ? map_err(mpt_sync(g, NULL)) : CUDA_SUCCESS; }
-EXPORT CUresult cuStreamWaitEvent(CUstream s, CUevent e, unsigned int flags) { return CUDA_SUCCESS; }
+EXPORT CUresult cuStreamDestroy(CUstream s) {
+    REQUIRE_INIT();
+    if (!s || sid(s) == 0) return CUDA_ERROR_INVALID_HANDLE;
+    mpt_stream_destroy(g, s->id);  /* pending work still completes, as in CUDA */
+    free(s);
+    return CUDA_SUCCESS;
+}
+EXPORT CUresult cuStreamSynchronize(CUstream s) {
+    REQUIRE_INIT();
+    CUresult r = map_err(mpt_stream_sync(g, sid(s), NULL));
+    reap_staging(0);
+    return r;
+}
+/* Never blocks: reports whether everything submitted to the stream has completed. */
+EXPORT CUresult cuStreamQuery(CUstream s) {
+    REQUIRE_INIT();
+    int r = mpt_stream_query(g, sid(s));
+    if (r < 0) return map_err(r);
+    return r ? CUDA_SUCCESS : CUDA_ERROR_NOT_READY;
+}
+EXPORT CUresult cuStreamGetFlags(CUstream s, unsigned int *flags) { *flags = sid(s) ? s->flags : 0; return CUDA_SUCCESS; }
+/* Work submitted to `s` after this call waits, on the GPU, for the event's most recent record. */
+EXPORT CUresult cuStreamWaitEvent(CUstream s, CUevent e, unsigned int flags) {
+    REQUIRE_INIT();
+    if (!e) return CUDA_ERROR_INVALID_HANDLE;
+    if (!e->recorded) return CUDA_SUCCESS;  /* never-recorded events are complete by definition */
+    return map_err(mpt_stream_wait_event(g, sid(s), e->ev));
+}
 
 EXPORT CUresult cuEventCreate(CUevent *e, unsigned int flags) {
     REQUIRE_INIT();
+    if (!e) return CUDA_ERROR_INVALID_VALUE;
     struct CUevent_st *ev = calloc(1, sizeof *ev);
     ev->ev = mpt_alloc(g, sizeof(mpt_event), 256);
     if (!ev->ev) { free(ev); return CUDA_ERROR_OUT_OF_MEMORY; }
@@ -582,20 +728,35 @@ EXPORT CUresult cuEventCreate(CUevent *e, unsigned int flags) {
     *e = ev;
     return CUDA_SUCCESS;
 }
-EXPORT CUresult cuEventDestroy(CUevent e) { if (e) { mpt_free(g, e->ev); free(e); } return CUDA_SUCCESS; }
+EXPORT CUresult cuEventDestroy(CUevent e) {
+    if (!e) return CUDA_ERROR_INVALID_HANDLE;
+    if (e->recorded) mpt_event_wait(g, e->ev);  /* host may still write the completion */
+    mpt_event_destroy(g, e->ev);
+    mpt_free(g, e->ev);
+    free(e);
+    return CUDA_SUCCESS;
+}
 EXPORT CUresult cuEventRecord(CUevent e, CUstream s) {
     REQUIRE_INIT();
+    if (!e) return CUDA_ERROR_INVALID_HANDLE;
     e->recorded = 1;
-    return map_err(mpt_event_record(g, e->ev));
+    return map_err(mpt_event_record_on(g, sid(s), e->ev));
 }
 EXPORT CUresult cuEventRecordWithFlags(CUevent e, CUstream s, unsigned int flags) { return cuEventRecord(e, s); }
-EXPORT CUresult cuEventSynchronize(CUevent e) { REQUIRE_INIT(); return e->recorded ? map_err(mpt_event_wait(g, e->ev)) : CUDA_SUCCESS; }
-EXPORT CUresult cuEventQuery(CUevent e) { return (!e->recorded || __atomic_load_n(&e->ev->done, __ATOMIC_ACQUIRE)) ? CUDA_SUCCESS : CUDA_ERROR_NOT_READY; }
+EXPORT CUresult cuEventSynchronize(CUevent e) {
+    REQUIRE_INIT();
+    if (!e) return CUDA_ERROR_INVALID_HANDLE;
+    return e->recorded ? map_err(mpt_event_wait(g, e->ev)) : CUDA_SUCCESS;
+}
+EXPORT CUresult cuEventQuery(CUevent e) {
+    if (!e) return CUDA_ERROR_INVALID_HANDLE;
+    return (!e->recorded || mpt_event_query(g, e->ev)) ? CUDA_SUCCESS : CUDA_ERROR_NOT_READY;
+}
 EXPORT CUresult cuEventElapsedTime(float *ms, CUevent a, CUevent b) {
     REQUIRE_INIT();
+    if (!ms || !a || !b) return CUDA_ERROR_INVALID_VALUE;
     if (!a->recorded || !b->recorded) return CUDA_ERROR_INVALID_HANDLE;
-    mpt_event_wait(g, a->ev);
-    mpt_event_wait(g, b->ev);
+    if (!mpt_event_query(g, a->ev) || !mpt_event_query(g, b->ev)) return CUDA_ERROR_NOT_READY;  /* CUDA: never blocks */
     *ms = (float)((double)((int64_t)b->ev->gpu_end_ns - (int64_t)a->ev->gpu_end_ns) / 1e6);
     return CUDA_SUCCESS;
 }

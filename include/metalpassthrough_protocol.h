@@ -29,7 +29,7 @@ extern "C" {
 #endif
 
 #define MPT_MAGIC            0x55504743u /* "MPT" little endian */
-#define MPT_ABI_VERSION      1u
+#define MPT_ABI_VERSION      2u        /* v2: streams, events with dependencies, capability bits */
 #define MPT_VSOCK_PORT       2049u
 #define MPT_HOST_CID         2u
 #define MPT_CACHELINE        128u        /* Apple Silicon L2 line */
@@ -89,8 +89,14 @@ typedef struct {
     uint64_t gpu_base;    /* MTLBuffer.gpuAddress of arena 0 */
     uint32_t session_id;
     uint32_t arena_id;    /* always 0 */
-    uint64_t reserved;
+    uint64_t caps;        /* MPT_CAP_* negotiated for this session */
 } mpt_hello_ack;        /* 32 bytes */
+
+/* Capabilities (HELLO ack caps / ALLOC_ARENA r2). UVA is *negotiated*: the host only sets
+ * MPT_CAP_UVA when it managed to place the arena at a 2 MiB-aligned GPU VA; guests must then
+ * still verify their own relocation succeeded, and fall back to translated addressing otherwise. */
+#define MPT_CAP_UVA      0x1ull   /* arena gpu_base is 2 MiB aligned: guest may mremap to VA == gpu_base */
+#define MPT_CAP_STREAMS  0x2ull   /* independent Metal queues per stream, event waits */
 
 /* ---- Ring header (arena 0 + 0). Each line is written by exactly one side. ---------------- */
 typedef struct MPT_ALIGNED(MPT_CACHELINE) {
@@ -133,6 +139,13 @@ typedef struct MPT_ALIGNED(32) {
 /* SQE flags */
 #define MPT_F_NO_CQE  0x0001u  /* fire-and-forget: no completion entry is posted on success */
 #define MPT_F_COMMIT  0x0002u  /* DISPATCH/COPY/FILL: commit the open command buffer afterwards */
+/* Stream selector for stream-ordered ops (DISPATCH, COPY, FILL, FLUSH, EVENT_RECORD, STREAM_*):
+ * bits 15:8 of flags. Stream 0 is the CUDA legacy default stream (implicitly synchronizes with
+ * every blocking stream); streams 1..255 are created with STREAM_CREATE. */
+#define MPT_F_STREAM_SHIFT 8u
+#define MPT_F_STREAM_MASK  0xFF00u
+#define MPT_MAX_STREAMS    256u
+static inline uint16_t mpt_stream_flags(uint32_t stream) { return (uint16_t)((stream & 0xFFu) << MPT_F_STREAM_SHIFT); }
 
 /* Opcodes. Argument conventions: "dev" = device address, "len" = byte length. */
 MPT_ENUM(uint16_t) {
@@ -155,8 +168,19 @@ MPT_ENUM(uint16_t) {
     MPT_OP_STATS        = 13, /* refreshes the stats block -> r0 = sizeof(mpt_stats) */
     MPT_OP_CLOSE        = 14,
     MPT_OP_FLUSH        = 15, /* commit the open command buffer without waiting */
+    MPT_OP_STREAM_CREATE = 16, /* a0 = MPT_STREAM_* flags -> r0 = stream id (1..255) */
+    MPT_OP_STREAM_DESTROY = 17, /* stream in flags; pending work still completes */
+    MPT_OP_STREAM_SYNC  = 18, /* stream in flags: commit + wait that stream (stream 0: + all blocking
+                                  streams) -> r0 = GPU ns of that stream since its last sync */
+    MPT_OP_STREAM_QUERY = 19, /* stream in flags: commit pending work, never waits -> r0 = 1 idle, 0 busy */
+    MPT_OP_STREAM_WAIT_EVENT = 20, /* stream in flags, a0 = mpt_event dev: later work on the stream waits
+                                       for the event's most recent record (no-op if never recorded) */
+    MPT_OP_EVENT_DESTROY = 21, /* a0 = mpt_event dev: drop host-side event state */
     MPT_OP__COUNT
 };
+
+/* STREAM_CREATE flags */
+#define MPT_STREAM_NON_BLOCKING 0x1u  /* no implicit synchronization with stream 0 */
 
 /* Compile flags */
 #define MPT_CF_FAST_MATH   0x1u   /* default is IEEE-safe math (bit-exact with CPU fmaf references) */

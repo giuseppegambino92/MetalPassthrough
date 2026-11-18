@@ -105,8 +105,8 @@ public final class MetalPassthroughServer: @unchecked Sendable {
     func serve(_ s: FDStream) throws {
         var hello = mpt_hello()
         try withUnsafeMutableBytes(of: &hello) { try s.readExact($0.baseAddress!, $0.count) }
-        func reply(_ status: Int32, _ base: UInt64 = 0, _ sid: UInt32 = 0) throws {
-            var ack = mpt_hello_ack(magic: MPT_MAGIC, status: status, gpu_base: base, session_id: sid, arena_id: 0, reserved: 0)
+        func reply(_ status: Int32, _ base: UInt64 = 0, _ sid: UInt32 = 0, _ caps: UInt64 = 0) throws {
+            var ack = mpt_hello_ack(magic: MPT_MAGIC, status: status, gpu_base: base, session_id: sid, arena_id: 0, caps: caps)
             try withUnsafeBytes(of: &ack) { try s.writeAll($0.baseAddress!, $0.count) }
         }
         guard hello.magic == MPT_MAGIC, hello.version == MPT_ABI_VERSION else {
@@ -116,6 +116,10 @@ public final class MetalPassthroughServer: @unchecked Sendable {
         let nonce = withUnsafeBytes(of: hello.nonce) { Array($0) }
         let comm = withUnsafeBytes(of: hello.comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
         let arenas = MetalArenaAllocator(device: device, memory: memory, guestMemoryBytes: guestMemoryBytes)
+        guard hello.nchunks >= 1, UInt64(hello.nchunks) <= arenas.maxChunks else {
+            try reply(MPT_EINVAL)
+            return
+        }
         let t0 = DispatchTime.now().uptimeNanoseconds
         let arena0: GuestArena
         do { arena0 = try arenas.map(nonce: nonce, count: Int(hello.nchunks)) } catch {
@@ -148,7 +152,7 @@ public final class MetalPassthroughServer: @unchecked Sendable {
             registry: registry, options: options)
         registry.opened(.init(session: sid, pid: hello.pid, comm: comm, arenaBytes: UInt64(arena0.length)))
         defer { registry.closed(sid) }
-        try reply(0, arena0.gpuBase, sid)
+        try reply(0, arena0.gpuBase, sid, MPT_CAP_STREAMS | (arena0.unifiedAddressable ? MPT_CAP_UVA : 0))
         disp.run()
     }
 }

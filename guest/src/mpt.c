@@ -38,9 +38,9 @@ typedef struct {
     uint32_t id;
     range_t *free;          /* sorted by offset, coalesced */
     uint32_t nfree;
+    range_t *live;          /* live allocations, sorted by offset */
+    uint32_t nlive, caplive;
 } arena_t;
-
-typedef struct { uintptr_t key; uint64_t size; } alloc_slot;
 
 struct mpt_ctx {
     int fd;
@@ -60,10 +60,9 @@ struct mpt_ctx {
     int debug;
     int uva;                         /* every arena satisfies guest VA == device address */
     int closed;                      /* session ended (process exit); calls fail with EPROTO */
+    uint64_t caps;                   /* MPT_CAP_* negotiated at HELLO */
     pthread_mutex_t lock;            /* serializes ring submission */
     atomic_flag alock;               /* allocator spinlock */
-    alloc_slot *amap;                /* open-addressing ptr -> size */
-    uint64_t amap_cap, amap_used;
 };
 
 static __thread char g_err[256];
@@ -170,9 +169,9 @@ static void *map_chunks(uint32_t n, uint8_t nonce[16]) {
 /* Unified virtual addressing: move the hugepage mapping so that guest VA == device address. The host
  * places chunk 0 at a 2 MiB-aligned GPU VA; hugetlb mremap needs that alignment. Returns the
  * (possibly unchanged) base. Never clobbers existing mappings (MAP_FIXED_NOREPLACE probe). */
-static uint8_t *relocate_uva(uint8_t *base, size_t len, uint64_t gpu_base, int *uva) {
+static uint8_t *relocate_uva(uint8_t *base, size_t len, uint64_t gpu_base, uint64_t caps, int *uva) {
     *uva = 0;
-    if (getenv("METALPASSTHROUGH_NO_UVA") || gpu_base % MPT_CHUNK_SIZE || (uintptr_t)base == gpu_base) {
+    if (!(caps & MPT_CAP_UVA) || getenv("METALPASSTHROUGH_NO_UVA") || gpu_base % MPT_CHUNK_SIZE || (uintptr_t)base == gpu_base) {
         *uva = (uintptr_t)base == gpu_base;
         return base;
     }
@@ -298,42 +297,36 @@ static int submit(mpt_ctx *c, mpt_sqe *e, mpt_cqe *out) {
 static inline void alock(mpt_ctx *c) { while (atomic_flag_test_and_set_explicit(&c->alock, memory_order_acquire)) cpu_relax(); }
 static inline void aunlock(mpt_ctx *c) { atomic_flag_clear_explicit(&c->alock, memory_order_release); }
 
-static inline uint64_t hash_ptr(uintptr_t p) { uint64_t x = p >> 8; x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; return x; }
-
-static void amap_put(mpt_ctx *c, uintptr_t key, uint64_t size);
-
-static void amap_grow(mpt_ctx *c) {
-    alloc_slot *old = c->amap;
-    uint64_t oc = c->amap_cap;
-    c->amap_cap = oc ? oc * 2 : 4096;
-    c->amap = calloc(c->amap_cap, sizeof(alloc_slot));
-    c->amap_used = 0;
-    for (uint64_t i = 0; i < oc; i++)
-        if (old[i].key && old[i].key != 1) amap_put(c, old[i].key, old[i].size);
-    free(old);
-}
-
-static void amap_put(mpt_ctx *c, uintptr_t key, uint64_t size) {
-    if ((c->amap_used + 1) * 2 > c->amap_cap) amap_grow(c);
-    uint64_t m = c->amap_cap - 1, i = hash_ptr(key) & m;
-    while (c->amap[i].key && c->amap[i].key != 1) i = (i + 1) & m;
-    c->amap[i].key = key;
-    c->amap[i].size = size;
-    c->amap_used++;
-}
-
-static uint64_t amap_take(mpt_ctx *c, uintptr_t key, int remove) {
-    if (!c->amap_cap) return 0;
-    uint64_t m = c->amap_cap - 1, i = hash_ptr(key) & m;
-    while (c->amap[i].key) {
-        if (c->amap[i].key == key) {
-            uint64_t s = c->amap[i].size;
-            if (remove) { c->amap[i].key = 1; /* tombstone */ }
-            return s;
-        }
-        i = (i + 1) & m;
+/* Live allocations per arena, sorted by offset: exact-base lookup for free(), containing-range
+ * lookup for bounds checks and interior pointers (cuMemGetAddressRange). */
+static int live_find(const arena_t *a, uint64_t off) {  /* index of the last entry with .off <= off, or -1 */
+    int lo = 0, hi = (int)a->nlive - 1, r = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (a->live[mid].off <= off) { r = mid; lo = mid + 1; } else hi = mid - 1;
     }
+    return r;
+}
+
+static int live_insert(arena_t *a, uint64_t off, uint64_t len) {
+    if (a->nlive == a->caplive) {
+        uint32_t nc = a->caplive ? a->caplive * 2 : 256;
+        range_t *nl = realloc(a->live, nc * sizeof(range_t));
+        if (!nl) return -1;
+        a->live = nl;
+        a->caplive = nc;
+    }
+    int k = live_find(a, off) + 1;
+    memmove(&a->live[k + 1], &a->live[k], (a->nlive - (uint32_t)k) * sizeof(range_t));
+    a->live[k].off = off;
+    a->live[k].len = len;
+    a->nlive++;
     return 0;
+}
+
+static void live_remove(arena_t *a, int k) {
+    memmove(&a->live[k], &a->live[k + 1], (a->nlive - (uint32_t)k - 1) * sizeof(range_t));
+    a->nlive--;
 }
 
 static int arena_alloc(arena_t *a, uint64_t size, uint64_t align, uint64_t *off_out) {
@@ -389,7 +382,7 @@ static void arena_release(arena_t *a, uint64_t off, uint64_t len) {
 static int grow(mpt_ctx *c, uint64_t min_bytes);
 
 MPT_API void *mpt_alloc(mpt_ctx *c, size_t bytes, size_t align) {
-    if (!c || !bytes) return NULL;
+    if (!c || !bytes || bytes > (1ull << 48)) return NULL;
     if (align < 256) align = 256;  /* Metal setBuffer offset alignment and cache-line friendliness */
     if (align & (align - 1)) return NULL;
     uint64_t size = (bytes + 255) & ~255ull;
@@ -398,9 +391,10 @@ MPT_API void *mpt_alloc(mpt_ctx *c, size_t bytes, size_t align) {
         uint32_t n = atomic_load(&c->narenas);
         for (uint32_t i = 0; i < n; i++) {
             uint64_t off;
-            if (arena_alloc(&c->arenas[i], size, align, &off) == 0) {
-                void *p = c->arenas[i].base + off;
-                amap_put(c, (uintptr_t)p, size);
+            arena_t *a = &c->arenas[i];
+            if (arena_alloc(a, size, align, &off) == 0) {
+                if (live_insert(a, off, size) != 0) { arena_release(a, off, size); break; }
+                void *p = a->base + off;
                 aunlock(c);
                 return p;
             }
@@ -425,17 +419,49 @@ static arena_t *arena_of(mpt_ctx *c, const void *p) {
 MPT_API void mpt_free(mpt_ctx *c, void *p) {
     if (!c || !p) return;
     alock(c);
-    uint64_t size = amap_take(c, (uintptr_t)p, 1);
     arena_t *a = arena_of(c, p);
-    if (size && a) arena_release(a, (uint64_t)((uint8_t *)p - a->base), size);
+    if (a) {
+        uint64_t off = (uint64_t)((uint8_t *)p - a->base);
+        int k = live_find(a, off);
+        if (k >= 0 && a->live[k].off == off) {  /* only exact allocation bases are freed */
+            uint64_t len = a->live[k].len;
+            live_remove(a, k);
+            arena_release(a, off, len);
+        }
+    }
     aunlock(c);
 }
 
-MPT_API size_t mpt_alloc_size(mpt_ctx *c, const void *p) {
+MPT_API int mpt_alloc_lookup(mpt_ctx *c, const void *p, void **base, size_t *size) {
+    int r = MPT_ENOENT;
     alock(c);
-    uint64_t s = amap_take(c, (uintptr_t)p, 0);
+    arena_t *a = arena_of(c, p);
+    if (a) {
+        uint64_t off = (uint64_t)((const uint8_t *)p - a->base);
+        int k = live_find(a, off);
+        if (k >= 0 && off < a->live[k].off + a->live[k].len) {
+            if (base) *base = a->base + a->live[k].off;
+            if (size) *size = a->live[k].len;
+            r = 0;
+        }
+    }
     aunlock(c);
-    return s;
+    return r;
+}
+
+MPT_API size_t mpt_alloc_size(mpt_ctx *c, const void *p) {
+    void *b;
+    size_t s;
+    return mpt_alloc_lookup(c, p, &b, &s) == 0 && b == p ? s : 0;
+}
+
+MPT_API int mpt_check_range(mpt_ctx *c, const void *p, size_t n) {
+    void *b;
+    size_t s;
+    if (!p) return MPT_EFAULT;
+    if (mpt_alloc_lookup(c, p, &b, &s) != 0) return MPT_EFAULT;
+    uint64_t off = (uint64_t)((const uint8_t *)p - (uint8_t *)b);
+    return (n <= s && off <= s - n) ? 0 : MPT_EFAULT;  /* overflow-safe: never computes p + n */
 }
 
 MPT_API uint64_t mpt_devaddr(mpt_ctx *c, const void *p) {
@@ -488,7 +514,7 @@ static int grow(mpt_ctx *c, uint64_t min_bytes) {
     int r = submit(c, &e, &q);
     if (r) { munmap(base, (size_t)nchunks * MPT_CHUNK_SIZE); return set_err(r, "ALLOC_ARENA failed: %s", mpt_strerror(r)); }
     int uva = 0;
-    base = relocate_uva(base, (size_t)nchunks * MPT_CHUNK_SIZE, q.r[1], &uva);
+    base = relocate_uva(base, (size_t)nchunks * MPT_CHUNK_SIZE, q.r[1], q.r[2], &uva);
     alock(c);
     if (!uva) c->uva = 0;
     uint32_t n = atomic_load(&c->narenas);
@@ -553,7 +579,8 @@ MPT_API int mpt_open(mpt_ctx **out, size_t arena_bytes) {
     }
     c->fd = fd;
     c->session = ack.session_id;
-    base = relocate_uva(base, (size_t)nchunks * MPT_CHUNK_SIZE, ack.gpu_base, &c->uva);
+    c->caps = ack.caps;
+    base = relocate_uva(base, (size_t)nchunks * MPT_CHUNK_SIZE, ack.gpu_base, ack.caps, &c->uva);
     c->ring = (mpt_ring_header *)(base + MPT_RING_OFFSET);
     if (__atomic_load_n(&c->ring->magic, __ATOMIC_ACQUIRE) != MPT_MAGIC || c->ring->sq_depth != MPT_SQ_DEPTH) {
         close(fd);
@@ -582,8 +609,8 @@ MPT_API void mpt_close(mpt_ctx *c) {
     for (uint32_t i = 0; i < n; i++) {
         munmap(c->arenas[i].base, c->arenas[i].len);
         free(c->arenas[i].free);
+        free(c->arenas[i].live);
     }
-    free(c->amap);
     free(c);
 }
 
@@ -698,7 +725,7 @@ MPT_API int mpt_release_pipeline(mpt_ctx *c, const mpt_pipeline *p) {
 
 /* ------------------------------------------------------------------ submission */
 
-static int dispatch_common(mpt_ctx *c, const mpt_pipeline *p, const uint32_t grid[3], const uint32_t tg[3], uint32_t mode,
+static int dispatch_common(mpt_ctx *c, uint32_t stream, const mpt_pipeline *p, const uint32_t grid[3], const uint32_t tg[3], uint32_t mode,
                            const mpt_arg *args, uint32_t nargs, uint32_t all_arenas, uint32_t flags) {
     size_t inline_bytes = 0;
     for (uint32_t i = 0; i < nargs; i++)
@@ -724,7 +751,8 @@ static int dispatch_common(mpt_ctx *c, const mpt_pipeline *p, const uint32_t gri
             if (!a) { pthread_mutex_unlock(&c->lock); return set_err(MPT_EFAULT, "argument %u is not MetalPassthrough arena memory", i); }
             b->addr = mpt_devaddr(c, args[i].ptr);
             uint64_t remain = a->len - (uint64_t)((const uint8_t *)args[i].ptr - a->base);
-            b->len = args[i].len && args[i].len < remain ? args[i].len : remain;
+            if (args[i].len > remain) { pthread_mutex_unlock(&c->lock); return set_err(MPT_EFAULT, "argument %u extends past its arena", i); }
+            b->len = args[i].len ? args[i].len : remain;
         } else if (args[i].kind == MPT_BIND_BYTES) {
             memcpy(desc + boff, args[i].ptr, args[i].len);
             b->addr = boff;
@@ -735,7 +763,7 @@ static int dispatch_common(mpt_ctx *c, const mpt_pipeline *p, const uint32_t gri
             b->len = args[i].len;
         }
     }
-    mpt_sqe e = { .opcode = MPT_OP_DISPATCH, .flags = (uint16_t)(MPT_F_NO_CQE | (flags & MPT_F_COMMIT)) };
+    mpt_sqe e = { .opcode = MPT_OP_DISPATCH, .flags = (uint16_t)(MPT_F_NO_CQE | (flags & MPT_F_COMMIT) | mpt_stream_flags(stream)) };
     e.a[0] = p->handle;
     e.a[1] = c->scratch_dev + (uint64_t)slot * MPT_SCRATCH_PER_SLOT;
     e.a[2] = need;
@@ -746,18 +774,28 @@ static int dispatch_common(mpt_ctx *c, const mpt_pipeline *p, const uint32_t gri
 }
 
 MPT_API int mpt_dispatch(mpt_ctx *c, const mpt_pipeline *p, const uint32_t grid[3], const uint32_t tg[3], uint32_t mode,
-                           const mpt_arg *args, uint32_t nargs, uint32_t flags) {
-    return dispatch_common(c, p, grid, tg, mode, args, nargs, 0, flags);
+                         const mpt_arg *args, uint32_t nargs, uint32_t flags) {
+    return dispatch_common(c, 0, p, grid, tg, mode, args, nargs, 0, flags);
 }
 
-MPT_API int mpt_dispatch_raw(mpt_ctx *c, const mpt_pipeline *p, const uint32_t grid[3], const uint32_t tg[3],
-                               const void *params, uint32_t params_len, uint32_t tg_memory, uint32_t flags) {
+MPT_API int mpt_dispatch_on(mpt_ctx *c, uint32_t stream, const mpt_pipeline *p, const uint32_t grid[3], const uint32_t tg[3],
+                            uint32_t mode, const mpt_arg *args, uint32_t nargs, uint32_t flags) {
+    return dispatch_common(c, stream, p, grid, tg, mode, args, nargs, 0, flags);
+}
+
+MPT_API int mpt_dispatch_raw_on(mpt_ctx *c, uint32_t stream, const mpt_pipeline *p, const uint32_t grid[3], const uint32_t tg[3],
+                                const void *params, uint32_t params_len, uint32_t tg_memory, uint32_t flags) {
     static const uint8_t zero[16];
     mpt_arg args[2] = {
         { .kind = MPT_BIND_BYTES, .index = 0, .ptr = params_len ? params : zero, .len = params_len ? params_len : 16 },
         { .kind = MPT_BIND_TGMEM, .index = 0, .len = tg_memory },
     };
-    return dispatch_common(c, p, grid, tg, MPT_DISPATCH_THREADGROUPS, args, tg_memory ? 2 : 1, 1, flags);
+    return dispatch_common(c, stream, p, grid, tg, MPT_DISPATCH_THREADGROUPS, args, tg_memory ? 2 : 1, 1, flags);
+}
+
+MPT_API int mpt_dispatch_raw(mpt_ctx *c, const mpt_pipeline *p, const uint32_t grid[3], const uint32_t tg[3],
+                             const void *params, uint32_t params_len, uint32_t tg_memory, uint32_t flags) {
+    return mpt_dispatch_raw_on(c, 0, p, grid, tg, params, params_len, tg_memory, flags);
 }
 
 static int simple(mpt_ctx *c, uint16_t op, uint16_t flags, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, mpt_cqe *q) {
@@ -766,17 +804,28 @@ static int simple(mpt_ctx *c, uint16_t op, uint16_t flags, uint64_t a0, uint64_t
     return submit(c, &e, q);
 }
 
-MPT_API int mpt_copy(mpt_ctx *c, uint64_t dst, uint64_t src, uint64_t len) {
+MPT_API int mpt_copy_on(mpt_ctx *c, uint32_t stream, uint64_t dst, uint64_t src, uint64_t len) {
     c->pending = 1;
-    return simple(c, MPT_OP_COPY, MPT_F_NO_CQE, dst, src, len, 0, NULL);
+    return simple(c, MPT_OP_COPY, MPT_F_NO_CQE | mpt_stream_flags(stream), dst, src, len, 0, NULL);
 }
+MPT_API int mpt_copy(mpt_ctx *c, uint64_t dst, uint64_t src, uint64_t len) { return mpt_copy_on(c, 0, dst, src, len); }
 
-MPT_API int mpt_fill(mpt_ctx *c, uint64_t dst, uint64_t len, uint32_t pattern, uint32_t width) {
+MPT_API int mpt_fill_on(mpt_ctx *c, uint32_t stream, uint64_t dst, uint64_t len, uint32_t pattern, uint32_t width) {
     c->pending = 1;
-    return simple(c, MPT_OP_FILL, MPT_F_NO_CQE, dst, len, pattern, width ? width : 1, NULL);
+    return simple(c, MPT_OP_FILL, MPT_F_NO_CQE | mpt_stream_flags(stream), dst, len, pattern, width ? width : 1, NULL);
+}
+MPT_API int mpt_fill(mpt_ctx *c, uint64_t dst, uint64_t len, uint32_t pattern, uint32_t width) {
+    return mpt_fill_on(c, 0, dst, len, pattern, width);
 }
 
 MPT_API int mpt_flush(mpt_ctx *c) { return simple(c, MPT_OP_FLUSH, MPT_F_NO_CQE, 0, 0, 0, 0, NULL); }
+
+/* Takes the sticky asynchronous error, if any (CUDA reports async failures at the next sync). */
+static int take_sticky(mpt_ctx *c, int r) {
+    if (!r && c->sticky) r = c->sticky;
+    c->sticky = 0;
+    return r;
+}
 
 MPT_API int mpt_sync(mpt_ctx *c, uint64_t *gpu_ns) {
     mpt_cqe q = { 0 };
@@ -784,9 +833,7 @@ MPT_API int mpt_sync(mpt_ctx *c, uint64_t *gpu_ns) {
     pthread_mutex_lock(&c->lock);
     sq_reserve(c);
     mpt_sqe e = { .opcode = MPT_OP_SYNC };
-    int r = submit_locked(c, &e, &q);
-    if (!r && c->sticky) { r = c->sticky; }
-    c->sticky = 0;
+    int r = take_sticky(c, submit_locked(c, &e, &q));
     c->pending = 0;
     pthread_mutex_unlock(&c->lock);
     if (gpu_ns) *gpu_ns = q.r[0];
@@ -796,11 +843,62 @@ MPT_API int mpt_sync(mpt_ctx *c, uint64_t *gpu_ns) {
 
 MPT_API int mpt_pending(mpt_ctx *c) { return c->pending; }
 
-MPT_API int mpt_event_record(mpt_ctx *c, mpt_event *ev) {
+/* ---- streams ---- */
+
+MPT_API int mpt_stream_create(mpt_ctx *c, uint32_t flags, uint32_t *stream) {
+    if (!(c->caps & MPT_CAP_STREAMS)) return set_err(MPT_EPROTO, "host does not support streams");
+    mpt_cqe q;
+    int r = simple(c, MPT_OP_STREAM_CREATE, 0, flags, 0, 0, 0, &q);
+    if (!r) *stream = (uint32_t)q.r[0];
+    return r;
+}
+
+MPT_API int mpt_stream_destroy(mpt_ctx *c, uint32_t stream) {
+    if (!stream) return MPT_EINVAL;
+    return simple(c, MPT_OP_STREAM_DESTROY, mpt_stream_flags(stream), 0, 0, 0, 0, NULL);
+}
+
+MPT_API int mpt_stream_sync(mpt_ctx *c, uint32_t stream, uint64_t *gpu_ns) {
+    mpt_cqe q = { 0 };
+    if (c->closed) return MPT_EPROTO;
+    pthread_mutex_lock(&c->lock);
+    sq_reserve(c);
+    mpt_sqe e = { .opcode = MPT_OP_STREAM_SYNC, .flags = mpt_stream_flags(stream) };
+    int r = take_sticky(c, submit_locked(c, &e, &q));
+    pthread_mutex_unlock(&c->lock);
+    if (gpu_ns) *gpu_ns = q.r[0];
+    return r;
+}
+
+MPT_API int mpt_stream_query(mpt_ctx *c, uint32_t stream) {
+    mpt_cqe q = { 0 };
+    int r = simple(c, MPT_OP_STREAM_QUERY, mpt_stream_flags(stream), 0, 0, 0, 0, &q);
+    return r ? r : (int)q.r[0];
+}
+
+MPT_API int mpt_stream_wait_event(mpt_ctx *c, uint32_t stream, const mpt_event *ev) {
+    uint64_t dev = mpt_devaddr(c, ev);
+    if (!dev) return set_err(MPT_EFAULT, "event must live in arena memory");
+    return simple(c, MPT_OP_STREAM_WAIT_EVENT, MPT_F_NO_CQE | mpt_stream_flags(stream), dev, 0, 0, 0, NULL);
+}
+
+MPT_API int mpt_event_record_on(mpt_ctx *c, uint32_t stream, mpt_event *ev) {
     uint64_t dev = mpt_devaddr(c, ev);
     if (!dev) return set_err(MPT_EFAULT, "event must live in arena memory");
     __atomic_store_n(&ev->done, 0, __ATOMIC_RELEASE);
-    return simple(c, MPT_OP_EVENT_RECORD, MPT_F_NO_CQE, dev, 0, 0, 0, NULL);
+    return simple(c, MPT_OP_EVENT_RECORD, MPT_F_NO_CQE | mpt_stream_flags(stream), dev, 0, 0, 0, NULL);
+}
+
+MPT_API int mpt_event_record(mpt_ctx *c, mpt_event *ev) { return mpt_event_record_on(c, 0, ev); }
+
+MPT_API int mpt_event_destroy(mpt_ctx *c, mpt_event *ev) {
+    uint64_t dev = mpt_devaddr(c, ev);
+    return dev ? simple(c, MPT_OP_EVENT_DESTROY, MPT_F_NO_CQE, dev, 0, 0, 0, NULL) : MPT_EFAULT;
+}
+
+MPT_API int mpt_event_query(mpt_ctx *c, const mpt_event *ev) {
+    (void)c;
+    return __atomic_load_n(&ev->done, __ATOMIC_ACQUIRE) ? 1 : 0;
 }
 
 MPT_API int mpt_event_wait(mpt_ctx *c, mpt_event *ev) {
