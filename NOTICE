@@ -1,0 +1,9 @@
+MetalPassthrough
+Copyright 2026 Giuseppe Gambino
+
+This product includes software developed by Giuseppe Gambino and MetalPassthrough contributors.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+NVIDIA CUDA headers are used only at build time inside the builder image; no NVIDIA software is
+redistributed. "CUDA" is a trademark of NVIDIA Corporation. "Apple", "Metal" and "macOS" are
+trademarks of Apple Inc. This project is not affiliated with or endorsed by NVIDIA or Apple.

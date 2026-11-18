@@ -1,0 +1,215 @@
+From 4afa1afb523158f29b2a4962c87be11a2fb57cc1 Mon Sep 17 00:00:00 2001
+From: Giuseppe Gambino <17169769+giuseppegambino92@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 23:22:14 +0100
+Subject: [PATCH] feat: --gpu flag for zero-copy Metal GPU passthrough
+ (MetalPassthrough)
+
+Adds `container run|create --gpu`, which attaches MetalPassthrough to the
+container's VM:
+
+- reserves 2 MiB guest hugepages at boot (hugepages=N kernel argument)
+  for a zero-copy GPU arena;
+- attaches a VZCustomVirtioDevice (macOS 27) that gives the runtime
+  helper direct access to guest RAM, so the Apple GPU computes in place
+  on guest memory via MTLDevice.makeBuffer(bytesNoCopy:);
+- serves the MetalPassthrough ring/doorbell protocol on vsock port 2049 from
+  container-runtime-linux;
+- bind-mounts the guest runtime (libmetalpassthrough, libcuda.so.1,
+  libcudart.so.12, apple-smi, Python package) at /usr/local/metalpassthrough
+  and sets PATH / LD_LIBRARY_PATH / PYTHONPATH.
+
+The ContainerConfiguration field is decoded with decodeIfPresent, so
+existing bundles and older clients are unaffected. On macOS < 27 --gpu
+fails with an unsupported error; nothing changes without the flag.
+---
+ Package.swift                                 |  5 +++
+ .../Container/ContainerConfiguration.swift    |  5 +++
+ .../ContainerAPIService/Client/Flags.swift    |  7 ++++
+ .../ContainerAPIService/Client/Utility.swift  |  2 ++
+ .../RuntimeLinux/Server/RuntimeService.swift  | 32 +++++++++++++++++--
+ 5 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/Package.swift b/Package.swift
+index f5e5b0e..b8d138a 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -24,6 +24,9 @@ let releaseVersion = ProcessInfo.processInfo.environment["RELEASE_VERSION"] ?? "
+ let gitCommit = ProcessInfo.processInfo.environment["GIT_COMMIT"] ?? "unspecified"
+ let builderShimVersion = "0.13.3"
+ let scVersion = "0.54.0"
++/// MetalPassthrough (Metal GPU passthrough for `--gpu`). Defaults to a sibling checkout; override with
++/// METALPASSTHROUGH_PATH=/path/to/MetalPassthrough.
++let metalPassthroughPath = Context.environment["METALPASSTHROUGH_PATH"] ?? "../MetalPassthrough"
+ 
+ let package = Package(
+     name: "container",
+@@ -57,6 +60,7 @@ let package = Package(
+     ],
+     dependencies: [
+         .package(url: "https://github.com/apple/containerization.git", exact: Version(stringLiteral: scVersion)),
++        .package(name: "MetalPassthrough", path: metalPassthroughPath),
+         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.7.0"),
+         .package(url: "https://github.com/apple/swift-collections.git", from: "1.2.0"),
+         .package(url: "https://github.com/apple/swift-configuration", from: "1.0.0"),
+@@ -540,6 +544,7 @@ let package = Package(
+         .target(
+             name: "ContainerRuntimeLinuxServer",
+             dependencies: [
++                .product(name: "MetalPassthroughHost", package: "MetalPassthrough"),
+                 .product(name: "Logging", package: "swift-log"),
+                 .product(name: "Containerization", package: "containerization"),
+                 .product(name: "ContainerizationExtras", package: "containerization"),
+diff --git a/Sources/ContainerResource/Container/ContainerConfiguration.swift b/Sources/ContainerResource/Container/ContainerConfiguration.swift
+index 87e0f90..041dc88 100644
+--- a/Sources/ContainerResource/Container/ContainerConfiguration.swift
++++ b/Sources/ContainerResource/Container/ContainerConfiguration.swift
+@@ -38,6 +38,9 @@ public struct ContainerConfiguration: Sendable, Codable {
+     public var dns: DNSConfiguration? = nil
+     /// Whether to enable rosetta x86-64 translation for the container.
+     public var rosetta: Bool = false
++    /// Whether to expose the host Apple GPU to the container through MetalPassthrough
++    /// (zero-copy Metal compute, CUDA Driver/Runtime bridge, apple-smi).
++    public var gpu: Bool = false
+     /// Initial or main process of the container.
+     public var initProcess: ProcessConfiguration
+     /// Platform for the container.
+@@ -84,6 +87,7 @@ public struct ContainerConfiguration: Sendable, Codable {
+         case networks
+         case dns
+         case rosetta
++        case gpu
+         case initProcess
+         case platform
+         case resources
+@@ -122,6 +126,7 @@ public struct ContainerConfiguration: Sendable, Codable {
+ 
+         dns = try container.decodeIfPresent(DNSConfiguration.self, forKey: .dns)
+         rosetta = try container.decodeIfPresent(Bool.self, forKey: .rosetta) ?? false
++        gpu = try container.decodeIfPresent(Bool.self, forKey: .gpu) ?? false
+         initProcess = try container.decode(ProcessConfiguration.self, forKey: .initProcess)
+         platform = try container.decodeIfPresent(ContainerizationOCI.Platform.self, forKey: .platform) ?? .current
+         resources = try container.decodeIfPresent(Resources.self, forKey: .resources) ?? .init()
+diff --git a/Sources/Services/ContainerAPIService/Client/Flags.swift b/Sources/Services/ContainerAPIService/Client/Flags.swift
+index a067cb6..530c328 100644
+--- a/Sources/Services/ContainerAPIService/Client/Flags.swift
++++ b/Sources/Services/ContainerAPIService/Client/Flags.swift
+@@ -190,6 +190,7 @@ public struct Flags {
+             readonlyPaths: [String],
+             remove: Bool,
+             rosetta: Bool,
++            gpu: Bool = false,
+             runtime: String?,
+             ssh: Bool,
+             shmSize: String?,
+@@ -222,6 +223,7 @@ public struct Flags {
+             self.readonlyPaths = readonlyPaths
+             self.remove = remove
+             self.rosetta = rosetta
++            self.gpu = gpu
+             self.runtime = runtime
+             self.ssh = ssh
+             self.shmSize = shmSize
+@@ -360,6 +362,11 @@ public struct Flags {
+         @Flag(name: .long, help: "Enable Rosetta in the container")
+         public var rosetta = false
+ 
++        @Flag(
++            name: .long,
++            help: "Expose the host Apple GPU via MetalPassthrough (zero-copy Metal compute, CUDA bridge, apple-smi; macOS 27+)")
++        public var gpu = false
++
+         @Option(name: .long, help: "Set the runtime handler for the container (default: container-runtime-<os>)")
+         public var runtime: String?
+ 
+diff --git a/Sources/Services/ContainerAPIService/Client/Utility.swift b/Sources/Services/ContainerAPIService/Client/Utility.swift
+index 03ae3fb..6ef8f8e 100644
+--- a/Sources/Services/ContainerAPIService/Client/Utility.swift
++++ b/Sources/Services/ContainerAPIService/Client/Utility.swift
+@@ -239,6 +239,8 @@ public struct Utility {
+             throw ContainerizationError(.unsupported, message: "--rosetta flag requires an arm64 host")
+         }
+ 
++        config.gpu = management.gpu
++
+         config.labels = try Parser.labels(management.labels)
+ 
+         config.publishedPorts = try Parser.publishPorts(management.publishPorts)
+diff --git a/Sources/Services/RuntimeLinux/Server/RuntimeService.swift b/Sources/Services/RuntimeLinux/Server/RuntimeService.swift
+index 8ecc932..577de8f 100644
+--- a/Sources/Services/RuntimeLinux/Server/RuntimeService.swift
++++ b/Sources/Services/RuntimeLinux/Server/RuntimeService.swift
+@@ -20,6 +20,7 @@ import ContainerPersistence
+ import ContainerResource
+ import ContainerRuntimeClient
+ import ContainerXPC
++import MetalPassthroughHost
+ import Containerization
+ import ContainerizationError
+ import ContainerizationExtras
+@@ -172,12 +173,33 @@ public actor RuntimeService {
+                 }
+                 kernel.commandLine.kernelArgs.append("\(key)=\(value)")
+             }
+-            let vmm = VZVirtualMachineManager(
++            // --gpu: reserve guest hugepages for the zero-copy arena and attach the MetalPassthrough
++            // virtio device + vsock endpoint (served from this runtime helper process).
++            var gpuAttachment: (any Sendable)?
++            if config.gpu {
++                guard #available(macOS 27.0, *) else {
++                    throw ContainerizationError(.unsupported, message: "--gpu requires macOS 27 or newer")
++                }
++                let gpu = try MetalPassthroughAttachment(
++                    containerID: config.id,
++                    vmMemoryBytes: config.resources.memoryInBytes + VMResources.guestMemoryOverhead
++                )
++                kernel.commandLine.kernelArgs += gpu.kernelArgs
++                gpuAttachment = gpu
++                self.log.info("MetalPassthrough attached", metadata: ["hugepages": "\(gpu.hugepages)", "runtime": "\(gpu.guestRuntime ?? "none")"])
++            }
++            let baseVMM = VZVirtualMachineManager(
+                 kernel: kernel,
+                 initialFilesystem: bundle.initialFilesystem.asMount,
+                 rosetta: config.rosetta,
+                 logger: self.log
+             )
++            let vmm: any VirtualMachineManager
++            if #available(macOS 27.0, *), let gpu = gpuAttachment as? MetalPassthroughAttachment {
++                vmm = gpu.wrap(baseVMM)
++            } else {
++                vmm = baseVMM
++            }
+ 
+             let networkBootstrapInfos = try message.networkBootstrapInfos()
+ 
+@@ -272,6 +294,9 @@ public actor RuntimeService {
+             )
+             let container = try LinuxContainer(id, rootfs: rootfs, vmm: vmm, vm: vmResources, logger: self.log) { czConfig in
+                 try Self.configureContainer(czConfig: &czConfig, config: config, dynamicEnv: dynamicEnv, log: self.log)
++                if #available(macOS 27.0, *), let gpu = gpuAttachment as? MetalPassthroughAttachment {
++                    gpu.configure(&czConfig)
++                }
+                 czConfig.interfaces = interfaces
+                 czConfig.process.stdout = stdout
+                 czConfig.process.stderr = stderr
+@@ -296,7 +321,8 @@ public actor RuntimeService {
+                 config: config,
+                 attachments: attachments,
+                 bundle: bundle,
+-                io: (in: stdin, out: stdout, err: stderr)
++                io: (in: stdin, out: stdout, err: stderr),
++                gpu: gpuAttachment
+             )
+             await self.setContainer(ctrInfo)
+             await self.setNetworkSessions(sessions)
+@@ -1668,6 +1694,8 @@ extension RuntimeService {
+         let attachments: [Attachment]
+         let bundle: ContainerResource.Bundle
+         let io: (in: FileHandle?, out: MultiWriter?, err: MultiWriter?)
++        /// MetalPassthrough host endpoint for `--gpu` containers; lives as long as the container.
++        var gpu: (any Sendable)? = nil
+     }
+ 
+     /// States the underlying sandbox can be in.
+-- 
+2.54.0 (Apple Git-157)
+

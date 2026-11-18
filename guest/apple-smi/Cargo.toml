@@ -1,0 +1,13 @@
+[package]
+name = "apple-smi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "nvidia-smi for Apple GPUs inside Linux containers (MetalPassthrough)"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

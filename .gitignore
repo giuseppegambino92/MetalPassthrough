@@ -1,0 +1,23 @@
+# Build outputs
+.build/
+vendor/
+guest/dist/
+guest/apple-smi/target/
+*.metallib
+*.dylib
+*.so
+*.so.*
+*.o
+__pycache__/
+.DS_Store
+
+# End-to-end test binaries (built by `make e2e`)
+e2e/cuda/driver_test
+e2e/cuda/runtime_test
+e2e/native/native_test
+
+# Keep only the published test summary from build/
+build/*
+!build/results/
+build/results/*
+!build/results/summary.md
