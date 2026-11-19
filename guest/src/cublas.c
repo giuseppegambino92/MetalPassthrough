@@ -2,8 +2,14 @@
  * libcublas.so.12 — a cuBLAS subset for MetalPassthrough, compiled against NVIDIA's official
  * <cublas_v2.h> for exact ABI compatibility.
  *
- *   Level 3: cublasSgemm, cublasSgemmStridedBatched -> host MPSMatrixMultiplication (zero-copy)
+ *   Level 3 -> host MPSMatrixMultiplication on the arena (zero-copy):
+ *     cublasSgemm, cublasSgemmStridedBatched, cublasSgemmBatched,
+ *     cublasHgemm, cublasHgemmStridedBatched, cublasHgemmBatched,
+ *     cublasGemmEx, cublasGemmStridedBatchedEx, cublasGemmBatchedEx
+ *       (A/B in fp32, fp16 or bf16; C in fp32, fp16 or bf16; fp32 or fp16 compute)
+ *   Level 2: cublasSgemv (unit strides) -> the same GEMM path
  *   Level 1: cublasSaxpy, cublasSscal, cublasScopy, cublasSdot, cublasSnrm2 -> Metal kernels
+ *   Not provided: cuBLASLt, complex and fp64 BLAS, most level-2/3 routines (TRSM, SYRK, ...).
  *
  * All work is ordered on the handle's stream (cublasSetStream). Device pointers are MetalPassthrough
  * device addresses (equal to guest pointers under UVA).
@@ -141,34 +147,202 @@ EXPORT const char *cublasGetStatusString(cublasStatus_t s) { return cublasGetSta
 
 /* ---- Level 3 ---- */
 
-static cublasStatus_t gemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, const float *alpha,
-                           const float *A, int lda, long long sa, const float *B, int ldb, long long sb, const float *beta, float *C,
-                           int ldc, long long sc, int batch) {
+/* cublas_api.h declares the __half entry points only for C++; the ABI is a pointer to 2 bytes. */
+typedef struct { uint16_t x; } mpt_half;
+
+static float half_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff, u;
+    if (e == 0x1f) u = sign | 0x7f800000u | (m << 13);
+    else if (e) u = sign | ((e + 112) << 23) | (m << 13);
+    else if (!m) u = sign;
+    else {  /* subnormal */
+        e = 113;
+        while (!(m & 0x400)) { m <<= 1; e--; }
+        u = sign | (e << 23) | ((m & 0x3ff) << 13);
+    }
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+
+/* Reads alpha/beta: host or device pointer (cublasPointerMode), fp32 or fp16. */
+static float scalar_t(cublasHandle_t h, const void *v, int is_half) {
+    const void *p = v;
+    if (h->pmode != CUBLAS_POINTER_MODE_HOST) {
+        p = mpt_hostptr(h->ctx, (uint64_t)(uintptr_t)v);
+        if (!p) return NAN;
+        mpt_stream_sync(h->ctx, sid(h), NULL);  /* device-resident scalar: wait for its producer */
+    }
+    if (is_half) { uint16_t x; memcpy(&x, p, 2); return half_to_float(x); }
+    float f;
+    memcpy(&f, p, 4);
+    return f;
+}
+
+static int norm_op(cublasOperation_t *op) {
+    if (*op == CUBLAS_OP_C) *op = CUBLAS_OP_T;  /* real types: conjugate transpose == transpose */
+    return *op == CUBLAS_OP_N || *op == CUBLAS_OP_T;
+}
+
+/* Common GEMM: C = alpha op(A) op(B) + beta C, column-major, `batch` strided entries. */
+static cublasStatus_t gemm_core(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, float alpha,
+                                const void *A, int lda, long long sa, const void *B, int ldb, long long sb, float beta, void *C, int ldc,
+                                long long sc, int batch, uint32_t dtype) {
     if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
-    if (ta == CUBLAS_OP_C) ta = CUBLAS_OP_T;  /* real types: conjugate transpose == transpose */
-    if (tb == CUBLAS_OP_C) tb = CUBLAS_OP_T;
-    if (m < 0 || n < 0 || k < 0 || batch < 0 || (ta != CUBLAS_OP_N && ta != CUBLAS_OP_T) || (tb != CUBLAS_OP_N && tb != CUBLAS_OP_T))
+    if (m < 0 || n < 0 || k < 0 || batch < 0 || sa < 0 || sb < 0 || sc < 0 || !norm_op(&ta) || !norm_op(&tb))
         return CUBLAS_STATUS_INVALID_VALUE;
     if (!m || !n || !batch) return CUBLAS_STATUS_SUCCESS;
     mpt_gemm_desc g = {
-        .dtype = MPT_GEMM_F32, .trans_a = ta == CUBLAS_OP_T, .trans_b = tb == CUBLAS_OP_T,
+        .dtype = dtype, .trans_a = ta == CUBLAS_OP_T, .trans_b = tb == CUBLAS_OP_T,
         .m = (uint32_t)m, .n = (uint32_t)n, .k = (uint32_t)(k ? k : 1), .lda = (uint32_t)lda, .ldb = (uint32_t)ldb, .ldc = (uint32_t)ldc,
-        .batch = (uint32_t)batch, .alpha = k ? scalar(h, alpha) : 0.0f, .beta = scalar(h, beta),
+        .batch = (uint32_t)batch, .alpha = k ? alpha : 0.0f, .beta = beta,
         .a = (uint64_t)(uintptr_t)A, .b = (uint64_t)(uintptr_t)B, .c = (uint64_t)(uintptr_t)C,
         .stride_a = (uint64_t)sa, .stride_b = (uint64_t)sb, .stride_c = (uint64_t)sc,
     };
     return st(mpt_gemm_on(h->ctx, sid(h), &g));
 }
 
+/* Pointer-array batches: the arrays live in device memory; read them once the stream has
+ * produced them, then issue one GEMM per entry. */
+static cublasStatus_t gemm_ptr_batched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, float alpha,
+                                       const void *const *A, int lda, const void *const *B, int ldb, float beta, void *const *C, int ldc,
+                                       int batch, uint32_t dtype) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
+    if (!batch) return CUBLAS_STATUS_SUCCESS;
+    size_t bytes = (size_t)batch * sizeof(void *);
+    uint64_t *pa = mpt_hostptr(h->ctx, (uint64_t)(uintptr_t)A), *pb = mpt_hostptr(h->ctx, (uint64_t)(uintptr_t)B),
+             *pc = mpt_hostptr(h->ctx, (uint64_t)(uintptr_t)C);
+    if (!pa || !pb || !pc || mpt_check_range(h->ctx, pa, bytes) || mpt_check_range(h->ctx, pb, bytes) || mpt_check_range(h->ctx, pc, bytes))
+        return CUBLAS_STATUS_INVALID_VALUE;
+    mpt_stream_sync(h->ctx, sid(h), NULL);
+    for (int i = 0; i < batch; i++) {
+        cublasStatus_t r = gemm_core(h, ta, tb, m, n, k, alpha, (const void *)(uintptr_t)pa[i], lda, 0, (const void *)(uintptr_t)pb[i], ldb, 0,
+                                     beta, (void *)(uintptr_t)pc[i], ldc, 0, 1, dtype);
+        if (r != CUBLAS_STATUS_SUCCESS) return r;
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
 EXPORT cublasStatus_t cublasSgemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, const float *alpha,
                                   const float *A, int lda, const float *B, int ldb, const float *beta, float *C, int ldc) {
-    return gemm(h, ta, tb, m, n, k, alpha, A, lda, 0, B, ldb, 0, beta, C, ldc, 0, 1);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    return gemm_core(h, ta, tb, m, n, k, scalar_t(h, alpha, 0), A, lda, 0, B, ldb, 0, scalar_t(h, beta, 0), C, ldc, 0, 1, MPT_GEMM_F32);
 }
 
 EXPORT cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
                                                 const float *alpha, const float *A, int lda, long long sa, const float *B, int ldb,
                                                 long long sb, const float *beta, float *C, int ldc, long long sc, int batch) {
-    return gemm(h, ta, tb, m, n, k, alpha, A, lda, sa, B, ldb, sb, beta, C, ldc, sc, batch);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    return gemm_core(h, ta, tb, m, n, k, scalar_t(h, alpha, 0), A, lda, sa, B, ldb, sb, scalar_t(h, beta, 0), C, ldc, sc, batch, MPT_GEMM_F32);
+}
+
+EXPORT cublasStatus_t cublasSgemmBatched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                                         const float *alpha, const float *const A[], int lda, const float *const B[], int ldb,
+                                         const float *beta, float *const C[], int ldc, int batch) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    return gemm_ptr_batched(h, ta, tb, m, n, k, scalar_t(h, alpha, 0), (const void *const *)A, lda, (const void *const *)B, ldb,
+                            scalar_t(h, beta, 0), (void *const *)C, ldc, batch, MPT_GEMM_F32);
+}
+
+#define H16 MPT_GEMM_DTYPE(MPT_GEMM_F16, MPT_GEMM_F16, 1)
+
+EXPORT cublasStatus_t cublasHgemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, const mpt_half *alpha,
+                                  const mpt_half *A, int lda, const mpt_half *B, int ldb, const mpt_half *beta, mpt_half *C, int ldc) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    return gemm_core(h, ta, tb, m, n, k, scalar_t(h, alpha, 1), A, lda, 0, B, ldb, 0, scalar_t(h, beta, 1), C, ldc, 0, 1, H16);
+}
+
+EXPORT cublasStatus_t cublasHgemmStridedBatched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                                                const mpt_half *alpha, const mpt_half *A, int lda, long long sa, const mpt_half *B, int ldb,
+                                                long long sb, const mpt_half *beta, mpt_half *C, int ldc, long long sc, int batch) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    return gemm_core(h, ta, tb, m, n, k, scalar_t(h, alpha, 1), A, lda, sa, B, ldb, sb, scalar_t(h, beta, 1), C, ldc, sc, batch, H16);
+}
+
+EXPORT cublasStatus_t cublasHgemmBatched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                                         const mpt_half *alpha, const mpt_half *const A[], int lda, const mpt_half *const B[], int ldb,
+                                         const mpt_half *beta, mpt_half *const C[], int ldc, int batch) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    return gemm_ptr_batched(h, ta, tb, m, n, k, scalar_t(h, alpha, 1), (const void *const *)A, lda, (const void *const *)B, ldb,
+                            scalar_t(h, beta, 1), (void *const *)C, ldc, batch, H16);
+}
+
+static int mpt_dtype_of(cudaDataType t) {
+    switch ((int)t) {
+    case CUDA_R_32F: return MPT_GEMM_F32;
+    case CUDA_R_16F: return MPT_GEMM_F16;
+    case CUDA_R_16BF: return MPT_GEMM_BF16;
+    default: return -1;
+    }
+}
+
+/* GemmEx type rules: A and B share a type; fp16 compute needs fp16 everywhere (alpha/beta are
+ * mpt_half then); fp32 compute (including the TF32/16F/16BF "fast" variants, which run at full fp32
+ * precision here) takes float alpha/beta. Legacy callers pass cudaDataType as the compute type. */
+static cublasStatus_t ex_dtype(cudaDataType at, cudaDataType bt, cudaDataType ct, int compute, uint32_t *dtype, int *half_scalars) {
+    int a = mpt_dtype_of(at), b = mpt_dtype_of(bt), c = mpt_dtype_of(ct);
+    if (a < 0 || c < 0 || a != b) return CUBLAS_STATUS_NOT_SUPPORTED;
+    int acc16;
+    switch (compute) {
+    case CUBLAS_COMPUTE_16F: case CUBLAS_COMPUTE_16F_PEDANTIC: case CUDA_R_16F: acc16 = 1; break;
+    case CUBLAS_COMPUTE_32F: case CUBLAS_COMPUTE_32F_PEDANTIC: case CUBLAS_COMPUTE_32F_FAST_16F:
+    case CUBLAS_COMPUTE_32F_FAST_16BF: case CUBLAS_COMPUTE_32F_FAST_TF32: case CUDA_R_32F: acc16 = 0; break;
+    default: return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    if (acc16 && (a != MPT_GEMM_F16 || c != MPT_GEMM_F16)) return CUBLAS_STATUS_NOT_SUPPORTED;
+    *dtype = MPT_GEMM_DTYPE(a, c, acc16);
+    *half_scalars = acc16;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, const void *alpha,
+                                   const void *A, cudaDataType at, int lda, const void *B, cudaDataType bt, int ldb, const void *beta,
+                                   void *C, cudaDataType ct, int ldc, cublasComputeType_t compute, cublasGemmAlgo_t algo) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    uint32_t dt;
+    int hs;
+    cublasStatus_t r = ex_dtype(at, bt, ct, (int)compute, &dt, &hs);
+    if (r) return r;
+    return gemm_core(h, ta, tb, m, n, k, scalar_t(h, alpha, hs), A, lda, 0, B, ldb, 0, scalar_t(h, beta, hs), C, ldc, 0, 1, dt);
+}
+
+EXPORT cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                                                 const void *alpha, const void *A, cudaDataType at, int lda, long long sa, const void *B,
+                                                 cudaDataType bt, int ldb, long long sb, const void *beta, void *C, cudaDataType ct, int ldc,
+                                                 long long sc, int batch, cublasComputeType_t compute, cublasGemmAlgo_t algo) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    uint32_t dt;
+    int hs;
+    cublasStatus_t r = ex_dtype(at, bt, ct, (int)compute, &dt, &hs);
+    if (r) return r;
+    return gemm_core(h, ta, tb, m, n, k, scalar_t(h, alpha, hs), A, lda, sa, B, ldb, sb, scalar_t(h, beta, hs), C, ldc, sc, batch, dt);
+}
+
+EXPORT cublasStatus_t cublasGemmBatchedEx(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                                          const void *alpha, const void *const A[], cudaDataType at, int lda, const void *const B[],
+                                          cudaDataType bt, int ldb, const void *beta, void *const C[], cudaDataType ct, int ldc, int batch,
+                                          cublasComputeType_t compute, cublasGemmAlgo_t algo) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    uint32_t dt;
+    int hs;
+    cublasStatus_t r = ex_dtype(at, bt, ct, (int)compute, &dt, &hs);
+    if (r) return r;
+    return gemm_ptr_batched(h, ta, tb, m, n, k, scalar_t(h, alpha, hs), A, lda, B, ldb, scalar_t(h, beta, hs), C, ldc, batch, dt);
+}
+
+/* ---- Level 2 ---- */
+
+/* y = alpha op(A) x + beta y as an (m x 1) GEMM. Unit strides only. */
+EXPORT cublasStatus_t cublasSgemv(cublasHandle_t h, cublasOperation_t trans, int m, int n, const float *alpha, const float *A, int lda,
+                                  const float *x, int incx, const float *beta, float *y, int incy) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (m < 0 || n < 0 || lda < (m > 1 ? m : 1) || !incx || !incy || !norm_op(&trans)) return CUBLAS_STATUS_INVALID_VALUE;
+    if (incx != 1 || incy != 1) return CUBLAS_STATUS_NOT_SUPPORTED;
+    int rows = trans == CUBLAS_OP_N ? m : n, inner = trans == CUBLAS_OP_N ? n : m;
+    if (!rows) return CUBLAS_STATUS_SUCCESS;
+    return gemm_core(h, trans, CUBLAS_OP_N, rows, 1, inner, scalar_t(h, alpha, 0), A, lda, 0, x, inner ? inner : 1, 0, scalar_t(h, beta, 0), y,
+                     rows, 0, 1, MPT_GEMM_F32);
 }
 
 /* ---- Level 1 ---- */

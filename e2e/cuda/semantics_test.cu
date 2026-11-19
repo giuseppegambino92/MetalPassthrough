@@ -55,29 +55,91 @@ int main() {
         iters *= 2;
     }
 
-    printf("[1] two non-blocking streams (independent Metal queues)\n");
+    printf("[1] independent streams run concurrently (low-occupancy kernels: 1 threadgroup each)\n");
     {
+        float *buf;
+        CK(cudaMalloc(&buf, 8 * 1024 * sizeof(float)));
+        double one = 0;
+        {
+            cudaStream_t s;
+            CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+            spin_then_write<<<1, 256, 0, s>>>(buf, iters, 1.0f);  // warm
+            CK(cudaStreamSynchronize(s));
+            double t0 = now_ms();
+            spin_then_write<<<1, 256, 0, s>>>(buf, iters, 1.0f);
+            CK(cudaStreamSynchronize(s));
+            one = now_ms() - t0;
+            CK(cudaStreamDestroy(s));
+        }
+        printf("  one kernel alone: %.1f ms\n", one);
+        struct { int n; unsigned flags; const char *what; } cases[] = {
+            { 2, cudaStreamNonBlocking, "2 non-blocking streams" },
+            { 4, cudaStreamNonBlocking, "4 non-blocking streams" },
+            { 2, cudaStreamDefault, "2 blocking streams (legacy default-stream rules, no stream-0 work)" },
+        };
+        for (auto &c : cases) {
+            cudaStream_t st[4];
+            cudaEvent_t t0e, done[4];
+            for (int i = 0; i < c.n; i++) { CK(cudaStreamCreateWithFlags(&st[i], c.flags)); CK(cudaEventCreate(&done[i])); }
+            CK(cudaEventCreate(&t0e));
+            CK(cudaEventRecord(t0e, st[0]));
+            double t0 = now_ms();
+            for (int i = 0; i < c.n; i++) {
+                spin_then_write<<<1, 256, 0, st[i]>>>(buf + 1024 * i, iters, (float)i);
+                CK(cudaEventRecord(done[i], st[i]));
+            }
+            for (int i = 0; i < c.n; i++) CK(cudaStreamSynchronize(st[i]));
+            double wall = now_ms() - t0;
+            // Timeline: completion time of each stream's kernel relative to the first launch.
+            printf("  %s: wall %.1f ms (serial ~%.1f ms); stream completion timeline:", c.what, wall, c.n * one);
+            for (int i = 0; i < c.n; i++) {
+                float ms;
+                CK(cudaEventElapsedTime(&ms, t0e, done[i]));
+                printf(" s%d@%.1f", i + 1, ms);
+            }
+            printf(" ms\n");
+            CHECK(wall < 1.5 * one, "%s overlap: %.2fx the time of one kernel (1.0 = fully concurrent, %d.0 = serialized)", c.what, wall / one, c.n);
+            for (int i = 0; i < c.n; i++) { CK(cudaStreamDestroy(st[i])); CK(cudaEventDestroy(done[i])); }
+            CK(cudaEventDestroy(t0e));
+        }
+        {   // The original failure mode: launch, launch, synchronize, with no event in between (an event
+            // record ends the stream's batch, which would hide a host that only commits on sync).
+            cudaStream_t a1, a2;
+            CK(cudaStreamCreateWithFlags(&a1, cudaStreamNonBlocking));
+            CK(cudaStreamCreateWithFlags(&a2, cudaStreamNonBlocking));
+            double t0 = now_ms();
+            spin_then_write<<<1, 256, 0, a1>>>(buf, iters, 1.0f);
+            spin_then_write<<<1, 256, 0, a2>>>(buf + 1024, iters, 2.0f);
+            CK(cudaStreamSynchronize(a1));
+            CK(cudaStreamSynchronize(a2));
+            double wall = now_ms() - t0;
+            CHECK(wall < 1.5 * one, "2 streams, launch-launch-sync without events: %.2fx the time of one kernel", wall / one);
+            CK(cudaStreamDestroy(a1));
+            CK(cudaStreamDestroy(a2));
+        }
+        // GPU-filling kernels cannot overlap (no free cores): informational only.
+        float *big;
+        const int n = 1 << 24;
+        CK(cudaMalloc(&big, 2 * (size_t)n * sizeof(float)));
         cudaStream_t s1, s2;
         CK(cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking));
         CK(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking));
-        double t0 = now_ms();
-        spin_then_write<<<1, 256, 0, s1>>>(a, iters, 1.0f);
+        add_one<<<n / 256, 256, 0, s1>>>(big, n);
         CK(cudaStreamSynchronize(s1));
-        double one = now_ms() - t0;
+        double t0 = now_ms();
+        for (int r = 0; r < 20; r++) add_one<<<n / 256, 256, 0, s1>>>(big, n);
+        CK(cudaStreamSynchronize(s1));
+        double a = now_ms() - t0;
         t0 = now_ms();
-        spin_then_write<<<1, 256, 0, s1>>>(a, iters, 1.0f);
-        spin_then_write<<<1, 256, 0, s2>>>(b, iters, 2.0f);
+        for (int r = 0; r < 20; r++) { add_one<<<n / 256, 256, 0, s1>>>(big, n); add_one<<<n / 256, 256, 0, s2>>>(big + n, n); }
         CK(cudaStreamSynchronize(s1));
         CK(cudaStreamSynchronize(s2));
-        double both = now_ms() - t0;
-        printf("  one kernel %.1f ms, two kernels on two streams %.1f ms (serial would be ~%.1f ms)\n", one, both, 2 * one);
-        // Informational: each stream is its own Metal command queue, but whether the GPU overlaps
-        // command buffers from different queues is up to the Metal driver. On M3 Max / macOS 27.2
-        // native Metal serializes this pattern too (see bench/concurrency), so this is measured,
-        // not asserted. Correctness of independent ordering is asserted in [3]-[5].
-        printf("  info: overlap factor %.2fx of a single kernel (1.0 = full overlap, 2.0 = serialized)\n", both / one);
+        double b = now_ms() - t0;
+        printf("  info: bandwidth-bound kernels (whole GPU): 1 stream %.1f ms, 2 streams x same work %.1f ms (%.2fx; ~2.0 expected when the GPU is saturated)\n", a, b, b / a);
         CK(cudaStreamDestroy(s1));
         CK(cudaStreamDestroy(s2));
+        CK(cudaFree(big));
+        CK(cudaFree(buf));
     }
 
     printf("[2] cudaStreamQuery never blocks\n");

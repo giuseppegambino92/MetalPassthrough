@@ -28,3 +28,5 @@ e2e/apps/cublas_gemm
 e2e/apps/cg_solver
 e2e/apps/attention
 bench/bench_guest
+e2e/robustness/isolation
+e2e/apps/cublas_mixed

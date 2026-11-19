@@ -60,10 +60,13 @@ references):
 | Shared-memory ring round trip (hot) | 0.3 µs |
 
 **Safety.** Every guest-supplied descriptor is copied before validation and bounds-checked
-against that VM's own memory; a protocol fuzzer (80k random commands, malformed handshakes, corrupted
-ring indices) runs against the real host. A process killed mid-kernel cannot have its pages
-recycled before the GPU drains. A guest *can* keep the GPU busy with a non-terminating kernel,
-since Metal offers no preemption for that.
+against that VM's own memory; a protocol fuzzer (random commands, malformed handshakes, corrupted
+ring indices, GEMM descriptors aimed at MPS's process-aborting assertions) runs against the real
+host. A process killed mid-kernel cannot have its pages recycled before the GPU drains (stress-tested
+with every word checked). Each VM's GPU work runs in that VM's own host process, so a shader with a
+forged pointer cannot reach another container (tested); processes *within* one container share a
+GPU address space. A guest *can* keep the GPU busy with a non-terminating kernel, since Metal
+offers no preemption for that.
 
 **Limits.** This is compute only, with no graphics or Vulkan. It needs PTX, not SASS. There are
 no tensor-core instructions and no 64-bit atomics, and FP64 is emulated. To @hansmbakker's

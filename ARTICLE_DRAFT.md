@@ -216,17 +216,25 @@ None of these show up in a benchmark. All of them show up in production.
 record signals an `MTLSharedEvent`; `cuStreamWaitEvent` encodes a GPU-side wait on it, so the
 dependency costs no CPU round trip. The legacy default stream waits on, and is waited on by, every
 blocking stream, exactly as CUDA specifies. Queries read the event's counter and never block.
-Then the surprise: on an M3 Max, two independent 15.5 ms kernels on two queues take 31.2 ms
-*natively*. Metal runs compute command buffers from different queues back to back. So streams are
-now correct, not faster, and the test reports overlap as information, not as a pass condition.
+Then a mistake, which a second review caught. My first concurrency test showed two 22 ms kernels
+on two streams taking 45 ms, and a quick native Metal check "confirmed" that Metal serializes
+queues. The native check was wrong: both of its kernels wrote into one hazard-tracked buffer, so
+Metal correctly ordered them. With separate or untracked buffers, native Metal overlaps them
+completely. The real culprit was mine: when the guest synchronized stream 1, the host committed
+stream 1's batched work and blocked, leaving stream 2's work uncommitted until stream 1 finished.
+Committing every stream's open work before any blocking wait fixed it. Two and four independent
+streams now finish in 1.02–1.04× the time of one, and the test asserts it with a per-stream
+timeline.
 
 **Teardown that survives `kill -9`.** The guest kernel has `CONFIG_MODULES` off, so there is no
 driver to pin pages. The fix lives in user space: arenas are hugetlb `memfd`s, and on first use the
 library double-forks a tiny keeper that holds those file descriptors and a vsock connection
 authenticated with the session id and a nonce. If the client dies, its pages stay allocated until
-the host has drained the GPU and closes the keeper's connection. The crash test kills a process in
-the middle of 300 MiB of in-flight writes and has a second process grab the freed hugepages:
-68 874 corrupted words without the keeper, zero with it.
+the host has drained the GPU and closes the keeper's connection. The stress test runs 15 rounds:
+three GPU processes are SIGKILLed at random moments (mid-handshake, mid-allocation, mid-kernel),
+then a probe waits for the entire hugepage pool and checks every word of it. With the keeper:
+zero foreign words and zero leaked pages. With the keeper disabled: 16–19 million corrupted words
+per round.
 
 **Unified addressing as a capability.** The host now verifies the GPU address it predicted and
 advertises UVA in the handshake only when it holds; otherwise the guest library uses translated
@@ -241,8 +249,14 @@ dispatch-size checks, and a half-sent handshake that pinned a thread forever) an
 hang (a Linux vsock reports a closed peer as readable, not as hang-up). All five are fixed, and the
 fuzzer runs in the test suite.
 
-**Real workloads.** `libcublas.so.12`, compiled against NVIDIA's `cublas_v2.h`, sends SGEMM to
-Apple's `MPSMatrixMultiplication`, running in place on the container's pages. A conjugate-gradient
+**Real workloads.** `libcublas.so.12`, compiled against NVIDIA's `cublas_v2.h`, sends SGEMM,
+HGEMM and `cublasGemmEx` (fp16/bf16/fp32) to Apple's `MPSMatrixMultiplication`, running in place on
+the container's pages. Two MPS behaviors needed defending against. Its batched mode silently
+ignores the batch stride unless matrices are packed back to back, so cuBLAS's legal stride 0
+(broadcast) gave wrong answers without any error. Worse, its precondition checks are assertions:
+a matrix whose last row's padding runs past the end of its buffer aborts the *whole host process*.
+The host now computes MPS's exact byte requirement for every operand and stages anything that
+doesn't fit, and a fuzzer phase throws thousands of GEMM descriptors at exactly those edges. A conjugate-gradient
 Poisson solver with a million unknowns, a FlashAttention-style attention kernel, and kernels
 compiled by **Triton** on a Mac with no NVIDIA GPU all run, each checked against an independent
 reference. Triton's PTX found three parser bugs that nvcc's never triggered, the worst being
@@ -300,8 +314,9 @@ There are real limits:
 - **No SASS.** Binaries must carry PTX.
 - **Not translated:** textures, tensor-core instructions, `cp.async`, 64-bit atomics (Metal has
   none), and non-inlined device-function calls.
-- **No stream overlap.** Streams are correct, but Metal on this hardware runs them one after another.
-- **Shared GPU address space.** All processes in one VM share the host process's GPU address space.
+- **The VM is the isolation boundary.** A shader can build any pointer. It cannot reach another
+  VM (each VM's GPU work lives in its own host process and GPU address space, which a test asserts),
+  but it can read and write the GPU memory of other processes *in the same container*.
 - **GPU time is not partitioned.** A kernel that never terminates monopolizes the GPU; the session
   can be killed, the kernel cannot be preempted.
 

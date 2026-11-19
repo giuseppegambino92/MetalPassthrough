@@ -61,33 +61,73 @@ static int victim(size_t mib) {
     return 0;
 }
 
-static int probe(size_t mib, double watch_ms) {
+/* Waits for `mib` of hugepages, then watches them for `watch_ms`. full=0: samples 1 word in 1024
+ * for markers; full=1: scans every 32-bit word (every byte) for any non-zero value. */
+static int probe(size_t mib, double watch_ms, int full) {
     size_t len = mib << 20;
     double t0 = now_ms(), waited;
     void *p;
     for (;;) {
         p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0);
         if (p != MAP_FAILED) break;
-        if (now_ms() - t0 > 20000) { printf("probe: no hugepages after 20 s\n"); return 2; }
+        if (now_ms() - t0 > 30000) { printf("probe: no hugepages after 30 s\n"); return 2; }
         usleep(2000);
     }
     waited = now_ms() - t0;
     volatile uint32_t *w = p;
-    size_t nw = len / 4, seen = 0;
+    size_t nw = len / 4, seen = 0, scans = 0;
     double end = now_ms() + watch_ms;
-    while (now_ms() < end) {
+    do {
         size_t s = 0;
-        for (size_t i = 0; i < nw; i += 1024) s += w[i] == MARKER;  /* fresh pages are zero; only the GPU writes markers */
+        if (full) { for (size_t i = 0; i < nw; i++) s += w[i] != 0; }  /* fresh hugepages are zeroed */
+        else { for (size_t i = 0; i < nw; i += 1024) s += w[i] == MARKER; }
         if (s > seen) seen = s;
-        usleep(10000);
-    }
-    printf("probe: hugepages available after %.0f ms; foreign GPU writes observed in %zu sampled words\n", waited, seen);
+        scans++;
+        if (!full) usleep(10000);
+    } while (now_ms() < end);
+    if (full)
+        printf("probe: %zu MiB available after %.0f ms; %zu full scans of every word; non-zero (foreign) words: %zu\n", mib, waited, scans, seen);
+    else
+        printf("probe: hugepages available after %.0f ms; foreign GPU writes observed in %zu sampled words\n", waited, seen);
     return seen ? 1 : 0;
+}
+
+/* Holds `mib` of hugepages until killed (memory-exhaustion scenarios). */
+static int hog(size_t mib) {
+    void *p = mmap(NULL, mib << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0);
+    if (p == MAP_FAILED) { printf("hog: %zu MiB not available\n", mib); return 1; }
+    printf("HOG %zu MiB\n", mib);
+    fflush(stdout);
+    pause();
+    return 0;
+}
+
+/* Opens a session of `mib`, runs one dispatch, reports. Exit 0 = worked, 3 = cleanly refused. */
+static int try_open(size_t mib) {
+    mpt_ctx *c;
+    double t0 = now_ms();
+    if (mpt_open(&c, mib << 20) != 0) {
+        printf("open %zu MiB: refused in %.0f ms: %s\n", mib, now_ms() - t0, mpt_last_error());
+        return 3;
+    }
+    uint32_t *x = mpt_alloc(c, 1 << 20, 0);
+    mpt_pipeline p;
+    char log[4096];
+    uint32_t words = 1 << 18, rounds = 1;
+    uint32_t grid[3] = { 1u << 12, 1, 1 }, tg[3] = { 256, 1, 1 };
+    mpt_arg a[] = { { MPT_BIND_BUFFER, 0, x, 0 }, { MPT_BIND_BYTES, 1, &words, 4 }, { MPT_BIND_BYTES, 2, &rounds, 4 } };
+    int ok = x && !mpt_compile_msl(c, SRC, "scribble", 0, &p, log, sizeof log) &&
+             !mpt_dispatch(c, &p, grid, tg, MPT_DISPATCH_THREADS, a, 3, 0) && !mpt_sync(c, NULL) && x[words - 1] == MARKER;
+    printf("open %zu MiB: ok in %.0f ms, dispatch %s\n", mib, now_ms() - t0, ok ? "correct" : "FAILED");
+    mpt_close(c);
+    return ok ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "victim")) return victim((size_t)atol(argv[2]));
-    if (argc >= 4 && !strcmp(argv[1], "probe")) return probe((size_t)atol(argv[2]), atof(argv[3]));
-    fprintf(stderr, "usage: crash_test victim <MiB> | probe <MiB> <watch ms>\n");
+    if (argc >= 4 && !strcmp(argv[1], "probe")) return probe((size_t)atol(argv[2]), atof(argv[3]), argc > 4 && !strcmp(argv[4], "full"));
+    if (argc >= 3 && !strcmp(argv[1], "hog")) return hog((size_t)atol(argv[2]));
+    if (argc >= 3 && !strcmp(argv[1], "open")) return try_open((size_t)atol(argv[2]));
+    fprintf(stderr, "usage: crash_test victim <MiB> | probe <MiB> <watch ms> [full] | hog <MiB> | open <MiB>\n");
     return 2;
 }

@@ -231,6 +231,59 @@ static int phase_verify(void) {
     return (s || bad) ? 1 : 0;
 }
 
+/* GEMM descriptors aimed at the host's Metal Performance Shaders path, whose precondition checks
+ * are assertions that abort the process: odd leading dimensions, zero/gapped/overlapping batch
+ * strides, every dtype (and invalid ones), operands ending exactly at the arena's last byte. */
+static int phase_gemm(int iters) {
+    mpt_ctx *c;
+    if (mpt_open(&c, 64 << 20) != 0) return 1;
+    uint64_t len, base = mpt_debug_arena_range(c, &len);
+    const uint64_t lo = base + len - (16u << 20), hi = base + len;  /* heap tail: never the ring */
+    int ok = 0, rejected = 0;
+    for (int i = 0; i < iters; i++) {
+        mpt_gemm_desc g = { 0 };
+        uint32_t ab = (uint32_t)rpick(rpick(16) ? 3 : 8), cc = (uint32_t)rpick(rpick(16) ? 3 : 8);
+        g.dtype = rpick(32) ? MPT_GEMM_DTYPE(ab, cc, rpick(4) == 0) : (uint32_t)rnd();
+        g.trans_a = (uint32_t)rpick(rpick(32) ? 2 : 4);
+        g.trans_b = (uint32_t)rpick(rpick(32) ? 2 : 4);
+        g.m = (uint32_t)(rpick(64) ? rpick(48) + 1 : rnd() % (1u << 22));
+        g.n = (uint32_t)(rpick(64) ? rpick(48) + 1 : rnd() % (1u << 22));
+        g.k = (uint32_t)(rpick(64) ? rpick(48) + 1 : rnd() % (1u << 22));
+        g.batch = (uint32_t)(rpick(16) ? rpick(6) + 1 : rnd() % 100000);
+        g.alpha = 1.0f; g.beta = rpick(2) ? 0.0f : 0.5f;
+        size_t es_ab = ab == 0 ? 4 : 2, es_c = cc == 0 ? 4 : 2;
+        /* column-major storage: (rows x cols) with leading dimension ld */
+        uint32_t ar = g.trans_a ? g.k : g.m, acn = g.trans_a ? g.m : g.k;
+        uint32_t br = g.trans_b ? g.n : g.k, bcn = g.trans_b ? g.k : g.n;
+        g.lda = ar + (uint32_t)(rpick(8) ? rpick(5) : rnd() % 64) - (rpick(32) ? 0 : 1);
+        g.ldb = br + (uint32_t)(rpick(8) ? rpick(5) : rnd() % 64) - (rpick(32) ? 0 : 1);
+        g.ldc = g.m + (uint32_t)(rpick(8) ? rpick(5) : rnd() % 64) - (rpick(32) ? 0 : 1);
+        uint64_t ca = (uint64_t)g.lda * acn, cb = (uint64_t)g.ldb * bcn, ccn = (uint64_t)g.ldc * g.n;
+        uint64_t pick[4];
+        #define STRIDE(contig) (pick[0] = 0, pick[1] = (contig), pick[2] = (contig) + rpick(9), pick[3] = rnd() % ((contig) * 3 + 1), pick[rpick(4)])
+        g.stride_a = STRIDE(ca); g.stride_b = STRIDE(cb); g.stride_c = STRIDE(ccn);
+        /* Place each operand so that its last element is the arena's last element (most of the time). */
+        #define PLACE(stride, ld, rows, cols, es) ({ \
+            uint64_t span = ((uint64_t)(g.batch - 1) * (stride) + (uint64_t)((cols) ? (cols) - 1 : 0) * (ld) + (rows)) * (es); \
+            uint64_t at = span < (hi - lo) ? (hi - span) & ~(uint64_t)((es) - 1) : lo; \
+            rpick(4) ? at : rpick(2) ? lo + (rnd() % (hi - lo)) : rarg(); })
+        g.a = PLACE(g.stride_a, g.lda, ar, acn, es_ab);
+        g.b = PLACE(g.stride_b, g.ldb, br, bcn, es_ab);
+        g.c = PLACE(g.stride_c, g.ldc, g.m, g.n, es_c);
+        int r = mpt_gemm_on(c, rpick(8) ? 0 : (uint32_t)rpick(3), &g);  /* mostly the default stream (others do not exist) */
+        int s = r ? r : mpt_sync(c, NULL);
+        if (r == MPT_EPROTO || s == MPT_EPROTO) { printf("[G] session lost at iteration %d\n", i); return 1; }
+        if (s) rejected++; else ok++;
+        if (s && getenv("FUZZ_TRACE")) fprintf(stderr, "G %d: %s\n", i, mpt_last_error());
+    }
+    uint64_t rt;
+    int alive = mpt_ping(c, &rt) == 0;
+    printf("[G] %d GEMM descriptors (MPS path, arena-edge operands): %d executed, %d rejected; session alive: %s\n", iters, ok,
+           rejected, alive ? "yes" : "no");
+    mpt_close(c);
+    return !alive;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     int iters = argc > 1 ? atoi(argv[1]) : 20000;
@@ -241,6 +294,8 @@ int main(int argc, char **argv) {
     printf("[B] start\n");
     if (phase_ring(iters)) return 1;
     phase_faults();
+    printf("[G] start\n");
+    if (phase_gemm(iters / 4)) return 1;
     int violation_ignored = phase_ring_violation();
     int r = phase_verify() | violation_ignored;
     printf(r ? "fuzz: FAIL\n" : "fuzz: PASS (host survived and still computes correctly)\n");

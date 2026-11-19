@@ -39,6 +39,9 @@ final class StreamState {
     var waitedInOpenCB: [UInt32: UInt64] = [:]  // legacy-stream dependencies already encoded in `cb`
     var gpuNsSinceSync: UInt64 = 0  // updated under the dispatcher's statLock
     var firstError: Error?
+    /// Host-private fp32 staging for mixed-precision GEMM (A, B, C). Reused across this stream's
+    /// GEMMs: each GEMM ends its command buffer, and the next one starts only after it completed.
+    var gemmScratch: [MTLBuffer?] = [nil, nil, nil]
 
     init(id: UInt32, queue: MTLCommandQueue, blocking: Bool, progress: MTLSharedEvent, fence: MTLFence) {
         self.id = id
@@ -337,8 +340,11 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
         return c
     }
 
+    /// Blocks the worker until `s` completed. Every stream's batched work is committed first: the
+    /// worker cannot commit anything while it waits, so leaving other streams' command buffers
+    /// open would serialize independent streams behind this one.
     private func drain(_ s: StreamState) {
-        if s.hasOpenWork { commit(s) }
+        for o in streams.values where o.hasOpenWork { commit(o) }
         s.lastCommitted?.waitUntilCompleted()
     }
 
@@ -702,55 +708,166 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
         statLock.withLock { stats.dispatches &+= 1 }
     }
 
-    /// BLAS (column-major) SGEMM through MPSMatrixMultiplication. A column-major matrix with leading
-    /// dimension ld is the row-major transpose with rowBytes = ld * 4, so C^T = op(B)^T * op(A)^T is
-    /// computed in MPS's row-major world without moving data.
+    private static let convertSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void mpt_f16_to_f32(device const half* x [[buffer(0)]], device float* y [[buffer(1)]], constant uint& n [[buffer(2)]],
+                                   uint i [[thread_position_in_grid]]) { if (i < n) y[i] = float(x[i]); }
+        kernel void mpt_bf16_to_f32(device const ushort* x [[buffer(0)]], device float* y [[buffer(1)]], constant uint& n [[buffer(2)]],
+                                    uint i [[thread_position_in_grid]]) { if (i < n) y[i] = as_type<float>(uint(x[i]) << 16); }
+        kernel void mpt_f32_to_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant uint& n [[buffer(2)]],
+                                   uint i [[thread_position_in_grid]]) { if (i < n) y[i] = x[i]; }
+        kernel void mpt_f32_to_f16(device const float* x [[buffer(0)]], device half* y [[buffer(1)]], constant uint& n [[buffer(2)]],
+                                   uint i [[thread_position_in_grid]]) { if (i < n) y[i] = half(x[i]); }  // round to nearest even
+        kernel void mpt_f32_to_bf16(device const float* x [[buffer(0)]], device ushort* y [[buffer(1)]], constant uint& n [[buffer(2)]],
+                                    uint i [[thread_position_in_grid]]) {
+            if (i >= n) return;
+            uint u = as_type<uint>(x[i]);
+            y[i] = isnan(x[i]) ? ushort((u >> 16) | 0x40u) : ushort((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);  // RNE
+        }
+        """
+
+    /// BLAS (column-major) GEMM through MPSMatrixMultiplication. A column-major matrix with leading
+    /// dimension ld is the row-major transpose with rowBytes = ld * elementSize, so
+    /// C^T = op(B)^T * op(A)^T is computed in MPS's row-major world without moving data.
+    /// Types MPS takes directly (fp32, fp16 inputs; fp32 output; fp16 output with fp16 accumulation)
+    /// run in place on the arena. Otherwise operands are widened exactly to fp32 in per-stream scratch
+    /// buffers (bf16 and fp16 are subsets of fp32), multiplied in fp32, and rounded once (RNE) into
+    /// the output type, which matches cuBLAS's fp32-compute semantics.
     private func gemm(_ e: mpt_sqe, on s: StreamState) throws {
         let size = UInt64(MemoryLayout<mpt_gemm_desc>.size)
         guard e.a.1 == size else { throw OpError.invalid("gemm descriptor of \(e.a.1) bytes") }
         let g = try arenas.pointer(e.a.0, size).loadUnaligned(as: mpt_gemm_desc.self)
-        guard g.dtype == MPT_GEMM_F32, g.trans_a <= 1, g.trans_b <= 1, g.batch >= 1, g.batch <= 65536,
+        let abType = g.dtype & 0xff, cType = (g.dtype >> 8) & 0xff, acc16 = g.dtype & MPT_GEMM_ACC16 != 0
+        guard g.dtype & ~(0xffff | MPT_GEMM_ACC16) == 0, abType <= 2, cType <= 2, !acc16 || (abType == 1 && cType == 1) else {
+            throw OpError.invalid("gemm dtype 0x\(String(g.dtype, radix: 16))")
+        }
+        guard g.trans_a <= 1, g.trans_b <= 1, g.batch >= 1, g.batch <= 65536,
             g.m >= 1, g.n >= 1, g.k >= 1, g.m <= 1 << 20, g.n <= 1 << 20, g.k <= 1 << 20
         else { throw OpError.invalid("gemm shape m=\(g.m) n=\(g.n) k=\(g.k) batch=\(g.batch)") }
+        func esize(_ t: UInt32) -> Int { t == 0 ? 4 : 2 }
         let (m, n, k) = (Int(g.m), Int(g.n), Int(g.k))
-        // Row-major views (rows x cols, row stride ld) of the column-major operands.
-        let left = g.trans_b == 0 ? (rows: n, cols: k, ld: Int(g.ldb)) : (rows: k, cols: n, ld: Int(g.ldb))
-        let right = g.trans_a == 0 ? (rows: k, cols: m, ld: Int(g.lda)) : (rows: m, cols: k, ld: Int(g.lda))
-        let result = (rows: n, cols: m, ld: Int(g.ldc))
-        func view(_ dev: UInt64, _ v: (rows: Int, cols: Int, ld: Int), _ stride: UInt64) throws -> (GuestArena, Int) {
+        // Row-major views (rows x cols, row stride ld in elements) of the column-major operands.
+        typealias View = (rows: Int, cols: Int, ld: Int)
+        let left: View = g.trans_b == 0 ? (n, k, Int(g.ldb)) : (k, n, Int(g.ldb))
+        let right: View = g.trans_a == 0 ? (k, m, Int(g.lda)) : (m, k, Int(g.lda))
+        let result: View = (n, m, Int(g.ldc))
+        /// Validates an operand; returns its arena, byte offset and element count (all batch entries).
+        func view(_ dev: UInt64, _ v: View, _ stride: UInt64, _ es: Int) throws -> (GuestArena, Int, Int) {
             guard v.ld >= v.cols else { throw OpError.invalid("leading dimension \(v.ld) < \(v.cols)") }
-            let span = UInt64((v.rows - 1) * v.ld + v.cols) * 4
-            let (lastOff, o1) = (stride * 4).multipliedReportingOverflow(by: UInt64(g.batch - 1))
-            let (total, o2) = span.addingReportingOverflow(lastOff)
-            guard !o1, !o2, dev % 4 == 0 else { throw OpError.invalid("gemm operand range") }
-            return try arenas.resolve(dev, total)
+            let span = UInt64((v.rows - 1) * v.ld + v.cols)
+            let (last, o1) = stride.multipliedReportingOverflow(by: UInt64(g.batch - 1))
+            let (count, o2) = span.addingReportingOverflow(last)
+            let (bytes, o3) = count.multipliedReportingOverflow(by: UInt64(es))
+            guard !o1, !o2, !o3, dev % UInt64(es) == 0, count <= UInt64(UInt32.max) else { throw OpError.invalid("gemm operand range") }
+            let (a, off) = try arenas.resolve(dev, bytes)
+            return (a, off, Int(count))
         }
-        let (aL, oL) = try view(g.b, left, g.stride_b)
-        let (aR, oR) = try view(g.a, right, g.stride_a)
-        let (aC, oC) = try view(g.c, result, g.stride_c)
-        let mm = MPSMatrixMultiplication(
-            device: device, transposeLeft: g.trans_b == 1, transposeRight: g.trans_a == 1,
-            resultRows: n, resultColumns: m, interiorColumns: k, alpha: Double(g.alpha), beta: Double(g.beta))
-        func desc(_ v: (rows: Int, cols: Int, ld: Int), _ stride: UInt64) -> MPSMatrixDescriptor {
-            // Single matrices use the plain descriptor: the multi-matrix form (even with matrices = 1)
-            // made MPS pick a markedly slower kernel (measured 47-62% of native).
-            g.batch == 1
-                ? MPSMatrixDescriptor(rows: v.rows, columns: v.cols, rowBytes: v.ld * 4, dataType: .float32)
-                : MPSMatrixDescriptor(rows: v.rows, columns: v.cols, matrices: Int(g.batch), rowBytes: v.ld * 4,
-                                      matrixBytes: Int(stride) * 4, dataType: .float32)
+        let (aL, oL, nL) = try view(g.b, left, g.stride_b, esize(abType))
+        let (aR, oR, nR) = try view(g.a, right, g.stride_a, esize(abType))
+        let (aC, oC, nC) = try view(g.c, result, g.stride_c, esize(cType))
+
+        // MPS asserts (aborting this whole process) unless every matrix buffer holds
+        // offset + rows * rowBytes bytes (the last row's padding included) per batch entry; the guest
+        // only guarantees the elements it addresses. Operands that do not satisfy that inside their
+        // MTLBuffer, and types MPS cannot read (bf16), are staged through fp32 scratch instead.
+        func mpsBytes(_ v: View, _ stride: UInt64, _ es: Int) -> Int {
+            let one = v.rows * v.ld * es
+            return g.batch == 1 ? one : max(Int(g.batch) * Int(stride) * es, (Int(g.batch) - 1) * Int(stride) * es + one)
         }
+        func fits(_ a: GuestArena, _ off: Int, _ need: Int) -> Bool { a.bufferOffset + off + need <= a.buffer.length }
+        let esAB = esize(abType), esC = esize(cType)
+        let stageIn = abType == UInt32(MPT_GEMM_BF16) || !fits(aL, oL, mpsBytes(left, g.stride_b, esAB)) || !fits(aR, oR, mpsBytes(right, g.stride_a, esAB))
+        let stageOut = !(cType == 0 || (acc16 && cType == UInt32(MPT_GEMM_F16))) || !fits(aC, oC, mpsBytes(result, g.stride_c, esC)) || (acc16 && stageIn)
+        let inMPS: MPSDataType = stageIn || abType == 0 ? .float32 : .float16
+        let outMPS: MPSDataType = stageOut || cType == 0 ? .float32 : .float16
+
         // MPS encodes its own passes, which our per-stream fence cannot order (fences order the encoders
         // that wait on them, and the arena buffers are untracked). A command-buffer boundary does:
         // earlier work completes first (progress event), and later work waits for the GEMM.
         prepare(s)
         if s.hasOpenWork { commit(s) }
         let cb = openCB(s)
-        mm.batchSize = Int(g.batch)
-        mm.encode(
-            commandBuffer: cb,
-            leftMatrix: MPSMatrix(buffer: aL.buffer, offset: aL.bufferOffset + oL, descriptor: desc(left, g.stride_b)),
-            rightMatrix: MPSMatrix(buffer: aR.buffer, offset: aR.bufferOffset + oR, descriptor: desc(right, g.stride_a)),
-            resultMatrix: MPSMatrix(buffer: aC.buffer, offset: aC.bufferOffset + oC, descriptor: desc(result, g.stride_c)))
+
+        func scratch(_ slot: Int, _ bytes: Int) throws -> MTLBuffer {
+            let bytes = max(bytes, 16)
+            if let b = s.gemmScratch[slot], b.length >= bytes { return b }
+            guard bytes <= device.maxBufferLength, let b = device.makeBuffer(length: bytes, options: .storageModePrivate) else {
+                throw OpError.invalid("gemm staging buffer of \(bytes) bytes")
+            }
+            b.label = "metalpassthrough.gemm-scratch"
+            s.gemmScratch[slot] = b
+            return b
+        }
+        /// Encodes an element-wise conversion (scratch buffers are hazard-tracked: Metal orders the
+        /// encoders that touch them inside this command buffer).
+        func convert(_ fn: String, from src: MTLBuffer, _ srcOff: Int, to dst: MTLBuffer, _ dstOff: Int, count: Int) throws {
+            let ps = try pipelines.pipeline(source: Self.convertSource, function: fn, fastMath: false).state
+            var n = UInt32(count)
+            let enc = cb.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(ps)
+            enc.setBuffer(src, offset: srcOff, index: 0)
+            enc.setBuffer(dst, offset: dstOff, index: 1)
+            enc.setBytes(&n, length: 4, index: 2)
+            enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            enc.endEncoding()
+        }
+        let toF32 = ["mpt_f32_to_f32", "mpt_f16_to_f32", "mpt_bf16_to_f32"]
+        let fromF32 = ["mpt_f32_to_f32", "mpt_f32_to_f16", "mpt_f32_to_bf16"]
+        var (bufL, offL, bufR, offR) = (aL.buffer, aL.bufferOffset + oL, aR.buffer, aR.bufferOffset + oR)
+        if stageIn {  // widen exactly to fp32
+            let l = try scratch(0, mpsBytes(left, g.stride_b, 4)), r = try scratch(1, mpsBytes(right, g.stride_a, 4))
+            try convert(toF32[Int(abType)], from: aL.buffer, aL.bufferOffset + oL, to: l, 0, count: nL)
+            try convert(toF32[Int(abType)], from: aR.buffer, aR.bufferOffset + oR, to: r, 0, count: nR)
+            (bufL, offL, bufR, offR) = (l, 0, r, 0)
+        }
+        var (bufC, offC) = (aC.buffer, aC.bufferOffset + oC)
+        if stageOut {
+            // Preload C (also the gaps between columns/batches, so the write-back round-trips them exactly).
+            let c = try scratch(2, mpsBytes(result, g.stride_c, 4))
+            try convert(toF32[Int(cType)], from: aC.buffer, aC.bufferOffset + oC, to: c, 0, count: nC)
+            (bufC, offC) = (c, 0)
+        }
+        let mm = MPSMatrixMultiplication(
+            device: device, transposeLeft: g.trans_b == 1, transposeRight: g.trans_a == 1,
+            resultRows: n, resultColumns: m, interiorColumns: k, alpha: Double(g.alpha), beta: Double(g.beta))
+        // MPS's own batching silently ignores matrixBytes unless it equals rows * rowBytes (measured:
+        // any other stride, including cuBLAS's legal stride 0 broadcast, gives wrong results without an
+        // error), while arbitrary offsets are honored. So: native batching only for contiguous
+        // batches, otherwise one single-matrix encode per batch entry.
+        let contiguous = UInt64(left.rows * left.ld) == g.stride_b && UInt64(right.rows * right.ld) == g.stride_a
+            && UInt64(result.rows * result.ld) == g.stride_c
+        let esIn = inMPS == .float32 ? 4 : 2, esOut = outMPS == .float32 ? 4 : 2
+        func desc(_ v: View, _ stride: UInt64, _ t: MPSDataType, batched: Bool) -> MPSMatrixDescriptor {
+            let es = t == .float32 ? 4 : 2
+            // Single matrices use the plain descriptor: the multi-matrix form (even with matrices = 1)
+            // made MPS pick a markedly slower kernel (measured 47-62% of native).
+            return !batched
+                ? MPSMatrixDescriptor(rows: v.rows, columns: v.cols, rowBytes: v.ld * es, dataType: t)
+                : MPSMatrixDescriptor(rows: v.rows, columns: v.cols, matrices: Int(g.batch), rowBytes: v.ld * es,
+                                      matrixBytes: Int(stride) * es, dataType: t)
+        }
+        if g.batch == 1 || contiguous {
+            let batched = g.batch > 1
+            mm.batchSize = Int(g.batch)
+            mm.encode(
+                commandBuffer: cb,
+                leftMatrix: MPSMatrix(buffer: bufL, offset: offL, descriptor: desc(left, g.stride_b, inMPS, batched: batched)),
+                rightMatrix: MPSMatrix(buffer: bufR, offset: offR, descriptor: desc(right, g.stride_a, inMPS, batched: batched)),
+                resultMatrix: MPSMatrix(buffer: bufC, offset: offC, descriptor: desc(result, g.stride_c, outMPS, batched: batched)))
+        } else {
+            let dl = desc(left, 0, inMPS, batched: false), dr = desc(right, 0, inMPS, batched: false), dc = desc(result, 0, outMPS, batched: false)
+            for i in 0..<Int(g.batch) {
+                mm.encode(
+                    commandBuffer: cb,
+                    leftMatrix: MPSMatrix(buffer: bufL, offset: offL + i * Int(g.stride_b) * esIn, descriptor: dl),
+                    rightMatrix: MPSMatrix(buffer: bufR, offset: offR + i * Int(g.stride_a) * esIn, descriptor: dr),
+                    resultMatrix: MPSMatrix(buffer: bufC, offset: offC + i * Int(g.stride_c) * esOut, descriptor: dc))
+            }
+        }
+        if stageOut {  // fp32 -> output type, rounded once (RNE)
+            try convert(fromF32[Int(cType)], from: bufC, 0, to: aC.buffer, aC.bufferOffset + oC, count: nC)
+        }
         s.batched += 1
         statLock.withLock { stats.dispatches &+= 1 }
         commit(s)

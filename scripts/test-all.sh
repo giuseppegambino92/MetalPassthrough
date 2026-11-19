@@ -50,12 +50,27 @@ step "Test 4: Python NumPy/PyTorch/Triton zero-copy" test4-python.log run -e MET
 
 echo "== real workloads (stock nvcc / cuBLAS / Triton)"
 step "cuBLAS SGEMM (MPS) correctness + throughput" apps-cublas.log run -e METALPASSTHROUGH_ARENA_MB=1600 "$RUNTIME" /e2e/apps/cublas_gemm
+step "cuBLAS mixed precision (GemmEx fp16/bf16, Hgemm, batched, gemv)" apps-cublas-mixed.log run -e METALPASSTHROUGH_ARENA_MB=1600 "$RUNTIME" /e2e/apps/cublas_mixed
 step "CG Poisson solver, 1M unknowns (cuBLAS + SpMV)" apps-cg.log run "$RUNTIME" /e2e/apps/cg_solver 1024
 step "FlashAttention-style transformer attention" apps-attention.log run "$RUNTIME" /e2e/apps/attention 1024
 
 echo "== isolation and robustness"
 step "crash safety: SIGKILL with GPU work in flight" robust-crash.log sh -c "\"$MPT\" --hugepages 160 --memory 2048 --runtime \"$ROOT/guest/dist\" -v \"$ROOT/e2e:/e2e\" \"$RUNTIME\" sh /e2e/robustness/crash_test.sh | tee /dev/stderr | grep -q 'foreign GPU writes observed in 0 sampled'"
+step "crash stress: 15 rounds of random SIGKILLs, every word checked" robust-crash-stress.log \
+    "$MPT" --hugepages 256 --memory 2048 --runtime "$ROOT/guest/dist" -v "$ROOT/e2e:/e2e" "$RUNTIME" bash /e2e/robustness/crash_stress.sh 15
 step "protocol fuzzing (malicious guest), 5000 SQEs" robust-fuzz.log run --hugepages 1024 "$RUNTIME" /e2e/robustness/fuzz 5000 20261119
+# A raw-pointer shader in VM B aims at a live allocation of VM A: it must not reach it.
+cross_vm_isolation() {
+    "$MPT" --runtime "$ROOT/guest/dist" -v "$ROOT/e2e:/e2e" "$RUNTIME" /e2e/robustness/isolation victim 25 > "$OUT/iso-victim.out" 2>&1 &
+    v=$!
+    A=""
+    for i in $(seq 1 60); do A=$(sed -n 's/^VICTIM \(0x[0-9a-f]*\)$/\1/p' "$OUT/iso-victim.out"); [ -n "$A" ] && break; sleep 0.5; done
+    run "$RUNTIME" /e2e/robustness/isolation probe "$A" > "$OUT/iso-probe.out" 2>&1
+    wait $v
+    grep -v '^\[metal' "$OUT/iso-probe.out"; grep VICTIM "$OUT/iso-victim.out"
+    [ -n "$A" ] && grep -q 'modified by other processes/VMs: 0$' "$OUT/iso-victim.out" && ! grep -q 'victim address.*loaded 0xa5a5a5a5' "$OUT/iso-probe.out"
+}
+step "isolation: a wild-pointer shader cannot reach another VM" robust-isolation.log cross_vm_isolation
 step "multi-process: 6 concurrent GPU processes" robust-multi.log run "$RUNTIME" sh -c '
     for i in 1 2 3; do mpt-selftest > /tmp/s$i.log 2>&1 & /e2e/cuda/driver_test /e2e/cuda/kernels.ptx 256 > /tmp/d$i.log 2>&1 & done; wait
     grep -h "PASS\|FAIL" /tmp/s*.log /tmp/d*.log; [ $(grep -l PASS /tmp/s*.log /tmp/d*.log | wc -l) -eq 6 ]'
@@ -81,7 +96,7 @@ step "no-UVA: CUDA semantics" nouva-semantics.log env METALPASSTHROUGH_NO_UVA=1 
     echo "|---|---|---|"
     printf "%b\n" "$results" | sed '/^$/d'
     echo
-    for f in test1-apple-smi test2-native test3-driver test3-runtime test3-semantics test4-python apps-cublas apps-cg apps-attention robust-crash robust-fuzz robust-multi plugin selftest nouva-driver; do
+    for f in test1-apple-smi test2-native test3-driver test3-runtime test3-semantics test4-python apps-cublas apps-cg apps-attention apps-cublas-mixed robust-crash robust-crash-stress robust-fuzz robust-isolation robust-multi plugin selftest nouva-driver; do
         [ -f "$OUT/$f.log" ] || continue; echo "## $f"; echo; echo '```'; grep -v '^\[metalpassthrough' "$OUT/$f.log" | tail -40; echo '```'; echo
     done
 } > "$OUT/summary.md"

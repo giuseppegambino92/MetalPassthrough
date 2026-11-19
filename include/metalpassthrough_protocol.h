@@ -247,9 +247,13 @@ typedef struct {
 
 /* ---- GEMM descriptor (BLAS semantics, column-major like cuBLAS) --------------------------
  * C = alpha * op(A) * op(B) + beta * C, op(A) is m x k, op(B) is k x n, C is m x n. */
-enum { MPT_GEMM_F32 = 0 };
+/* dtype = A/B element type | C element type << 8 | MPT_GEMM_ACC16 (accumulate in fp16).
+ * MPT_GEMM_F32 (= 0) is the plain fp32 SGEMM. alpha/beta are always passed as float. */
+enum { MPT_GEMM_F32 = 0, MPT_GEMM_F16 = 1, MPT_GEMM_BF16 = 2 };
+#define MPT_GEMM_ACC16 (1u << 16)
+#define MPT_GEMM_DTYPE(ab, c, acc16) ((uint32_t)(ab) | ((uint32_t)(c) << 8) | ((acc16) ? MPT_GEMM_ACC16 : 0u))
 typedef struct {
-    uint32_t dtype;       /* MPT_GEMM_F32 */
+    uint32_t dtype;       /* MPT_GEMM_DTYPE(...) */
     uint32_t trans_a;     /* 0 = N, 1 = T */
     uint32_t trans_b;
     uint32_t m, n, k;

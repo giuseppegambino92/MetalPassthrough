@@ -40,8 +40,8 @@ e2e: guest
 	  nvcc -O3 -cudart shared -o cuda/runtime_test cuda/runtime_test.cu && \
 	  nvcc -O3 -cudart shared -o cuda/semantics_test cuda/semantics_test.cu -lcuda && \
 	  gcc -O2 -o native/native_test native/native_test.c -I/src/guest/dist/include -L/src/guest/dist/lib -lmetalpassthrough -lm && \
-	  for p in cublas_gemm cg_solver attention; do nvcc -O3 -cudart shared -o apps/$$p apps/$$p.cu -L/src/guest/dist/lib -lcublas || exit 1; done && \
-	  for p in crash_test fuzz; do gcc -O2 -o robustness/$$p robustness/$$p.c -I/src/guest/dist/include -L/src/guest/dist/lib \
+	  for p in cublas_gemm cublas_mixed cg_solver attention; do nvcc -O3 -cudart shared -Wno-deprecated-gpu-targets -o apps/$$p apps/$$p.cu -L/src/guest/dist/lib -lcublas || exit 1; done && \
+	  for p in crash_test fuzz isolation; do gcc -O2 -o robustness/$$p robustness/$$p.c -I/src/guest/dist/include -L/src/guest/dist/lib \
 	      -lmetalpassthrough -lm -Wl,-rpath,/usr/local/metalpassthrough/lib || exit 1; done'
 
 bench:
