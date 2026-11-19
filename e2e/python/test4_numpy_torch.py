@@ -126,6 +126,18 @@ check(rel < 1e-4, f"sgemm relative error {rel}")
 print(f"[3] SGEMM {M}x{N}x{K}: GPU {gpu_s * 1e3:.1f} ms = {2 * M * N * K / gpu_s / 1e12:.2f} TFLOP/s | numpy/OpenBLAS CPU "
       f"{cpu_s * 1e3:.0f} ms = {2 * M * N * K / cpu_s / 1e12:.2f} TFLOP/s | speedup {cpu_s / gpu_s:.0f}x | max rel err {rel:.1e}")
 
+# ---------------------------------------------------------------- 3b. optimized GEMM (host MPS)
+C2 = mpt.zeros((M, N), np.float32)
+mpt.matmul(A, B, C2)
+mpt.synchronize()
+for _ in range(reps):
+    mpt.matmul(A, B, C2)
+mps_s = mpt.synchronize() / reps
+rel2 = np.max(np.abs(C2 - ref)) / np.max(np.abs(ref))
+check(rel2 < 1e-4, f"mpt.matmul relative error {rel2}")
+print(f"[3b] mpt.matmul {M}x{N}x{K} (Metal Performance Shaders, zero-copy): {mps_s * 1e3:.1f} ms = "
+      f"{2 * M * N * K / mps_s / 1e12:.2f} TFLOP/s | {cpu_s / mps_s:.0f}x numpy | max rel err {rel2:.1e}")
+
 # ---------------------------------------------------------------- 4. PyTorch zero-copy interop
 try:
     import torch
@@ -157,6 +169,25 @@ vadd(a, b, c, np.int32(m), grid=((m + 255) // 256,), block=(256,))
 t = mpt.synchronize()
 check(np.array_equal(c, a + b), "ptx vector_add")
 print(f"[5] nvcc PTX vector_add via mpt.PTXKernel: {t * 1e3:.2f} ms, {3 * m * 4 / t / 1e9:.0f} GB/s, exact={np.array_equal(c, a + b)}")
+
+# ---------------------------------------------------------------- 6. Triton-generated PTX
+tdir = os.path.join(os.path.dirname(__file__), "..", "triton")
+tadd = mpt.PTXKernel(open(os.path.join(tdir, "add_kernel.ptx")).read(), "add_kernel")
+tsm = mpt.PTXKernel(open(os.path.join(tdir, "softmax_kernel.ptx")).read(), "softmax_kernel")
+c[...] = 0
+tadd(a, b, c, np.int32(m), 0, 0, grid=((m + 1023) // 1024,), block=(128,))  # + Triton's two scratch pointers
+t = mpt.synchronize()
+check(np.array_equal(c, a + b), "triton add_kernel")
+rows, cols = 4096, 1000
+logits = mpt.asarray(np.random.default_rng(1).standard_normal((rows, cols), dtype=np.float32))
+probs = mpt.zeros_like(logits)
+tsm(probs, logits, np.int32(cols), np.int32(cols), 0, 0, grid=(rows,), block=(128,), shared_mem=16)
+ts = mpt.synchronize()
+ex = np.exp(logits - logits.max(axis=1, keepdims=True))
+serr = float(np.max(np.abs(probs - ex / ex.sum(axis=1, keepdims=True))))
+check(serr < 1e-6, f"triton softmax error {serr}")
+print(f"[6] Triton 3.5 PTX (compiled on a machine without an NVIDIA GPU): add {t * 1e3:.2f} ms exact={np.array_equal(c, a + b)}, "
+      f"softmax {rows}x{cols} {ts * 1e3:.2f} ms max err {serr:.1e}")
 
 s = mpt.stats()
 print(f"stats: {s.dispatches} dispatches, {s.command_buffers} command buffers, compiles={s.pipeline_compiles}, "

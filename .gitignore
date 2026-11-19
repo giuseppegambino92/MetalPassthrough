@@ -22,3 +22,8 @@ build/*
 !build/results/
 build/results/*
 !build/results/summary.md
+e2e/robustness/crash_test
+e2e/robustness/fuzz
+e2e/apps/cublas_gemm
+e2e/apps/cg_solver
+e2e/apps/attention

@@ -200,19 +200,37 @@ enum PTXParser {
         var line = 1
         var bufLine = 1
         var vecDepth = 0
+        var lineStart = 0  // index in buf where the current line starts
         func flush() {
             let s = String(decoding: buf, as: UTF8.self)
             if !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { toks.append(.stmt(s, bufLine)) }
             buf.removeAll(keepingCapacity: true)
             bufLine = line
+            lineStart = 0
         }
-        // Directives that are terminated by end-of-line rather than ';'.
-        let lineDirectives = [".version", ".target", ".address_size", ".file", ".loc", ".section", ".pragma"]
+        // Directives terminated by end-of-line rather than ';'. They are handled per *line*: LLVM-based
+        // producers (Triton) put `.loc` lines between a label and its instruction, so checking the
+        // whole buffer would glue the directive to (and then drop) the following instruction.
+        let dropLines = [".loc", ".file", ".pragma"]
+        let ownStatements = [".version", ".target", ".address_size", ".section"]
         for c in bytes {
             if c == UInt8(ascii: "\n") {
-                let t = String(decoding: buf, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-                if vecDepth == 0, lineDirectives.contains(where: { t.hasPrefix($0) }) { flush() }
+                if vecDepth == 0 {
+                    let cur = String(decoding: buf[lineStart...], as: UTF8.self).trimmingCharacters(in: .whitespaces)
+                    if dropLines.contains(where: { cur.hasPrefix($0) }) {
+                        buf.removeSubrange(lineStart...)
+                    } else if ownStatements.contains(where: { cur.hasPrefix($0) }) {
+                        let before = Array(buf[..<lineStart])
+                        buf = before
+                        flush()  // whatever precedes (labels) stays a statement of its own
+                        buf = Array(cur.utf8)
+                        flush()
+                    }
+                }
                 line += 1
+                buf.append(c)
+                lineStart = buf.count
+                continue
             }
             if buf.allSatisfy({ $0 == 32 || $0 == 9 || $0 == 10 || $0 == 13 }) { bufLine = line }
             switch c {
@@ -251,8 +269,15 @@ enum PTXParser {
         var i = 0
         while i < toks.count {
             guard case .stmt(let raw, let line) = toks[i] else {
-                if case .open(let l) = toks[i] {
-                    throw PTXError(line: l, message: "unexpected '{' at module scope")
+                if case .open = toks[i] {
+                    // Module-scope brace blocks are DWARF payloads (`.section .debug_* { ... }`, emitted
+                    // by Triton/LLVM with line info): skip to the matching close.
+                    var depth = 0
+                    repeat {
+                        if case .open = toks[i] { depth += 1 } else if case .close = toks[i] { depth -= 1 }
+                        i += 1
+                    } while depth > 0 && i < toks.count
+                    continue
                 }
                 i += 1
                 continue
@@ -331,7 +356,8 @@ enum PTXParser {
             var type: PT?
             var rawName = w.last!
             var count = 1
-            if let k = w.firstIndex(of: ".align"), k + 1 < w.count { align = Int(w[k + 1]) ?? 0 }
+            // `.param .u64 .ptr .global .align 1 p`: that .align describes the pointee, not the param.
+            if let k = w.firstIndex(of: ".align"), k + 1 < w.count, !w.contains(".ptr") { align = Int(w[k + 1]) ?? 0 }
             for t in w where t.hasPrefix(".") { if let pt = PT.parse(String(t.dropFirst())) { type = pt } }
             if let lb = rawName.firstIndex(of: "[") {
                 count = Int(rawName[rawName.index(after: lb)...].dropLast()) ?? 1

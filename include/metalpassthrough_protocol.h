@@ -92,11 +92,25 @@ typedef struct {
     uint64_t caps;        /* MPT_CAP_* negotiated for this session */
 } mpt_hello_ack;        /* 32 bytes */
 
+/* Keeper handshake (second vsock connection, opened by the guest library right after HELLO).
+ * The keeper is a tiny guest process that holds the arena memfds; the host closes this connection
+ * (after writing one byte) only once the session's GPU work has drained and its arenas are
+ * unmapped. Until then the guest kernel cannot recycle the hugepages, even if the client process
+ * was SIGKILLed with GPU work still in flight. Authenticated by session id + the arena-0 nonce. */
+#define MPT_KEEPER_MAGIC 0x5045454Bu /* "KEEP" little endian */
+typedef struct {
+    uint32_t magic;       /* MPT_KEEPER_MAGIC */
+    uint32_t session_id;
+    uint8_t  nonce[16];
+    uint64_t reserved;
+} mpt_keeper_hello;      /* 32 bytes */
+
 /* Capabilities (HELLO ack caps / ALLOC_ARENA r2). UVA is *negotiated*: the host only sets
  * MPT_CAP_UVA when it managed to place the arena at a 2 MiB-aligned GPU VA; guests must then
  * still verify their own relocation succeeded, and fall back to translated addressing otherwise. */
 #define MPT_CAP_UVA      0x1ull   /* arena gpu_base is 2 MiB aligned: guest may mremap to VA == gpu_base */
 #define MPT_CAP_STREAMS  0x2ull   /* independent Metal queues per stream, event waits */
+#define MPT_CAP_KEEPER   0x4ull   /* host honours keeper connections (crash-safe teardown) */
 
 /* ---- Ring header (arena 0 + 0). Each line is written by exactly one side. ---------------- */
 typedef struct MPT_ALIGNED(MPT_CACHELINE) {
@@ -176,6 +190,8 @@ MPT_ENUM(uint16_t) {
     MPT_OP_STREAM_WAIT_EVENT = 20, /* stream in flags, a0 = mpt_event dev: later work on the stream waits
                                        for the event's most recent record (no-op if never recorded) */
     MPT_OP_EVENT_DESTROY = 21, /* a0 = mpt_event dev: drop host-side event state */
+    MPT_OP_GEMM         = 22, /* a0 = mpt_gemm_desc dev, a1 = len; stream in flags. Host-library GEMM
+                                  (MPSMatrixMultiplication) on arena memory, stream ordered */
     MPT_OP__COUNT
 };
 
@@ -228,6 +244,21 @@ typedef struct {
     uint32_t _pad;
     mpt_binding bindings[]; /* followed by inline bytes */
 } mpt_dispatch_desc;
+
+/* ---- GEMM descriptor (BLAS semantics, column-major like cuBLAS) --------------------------
+ * C = alpha * op(A) * op(B) + beta * C, op(A) is m x k, op(B) is k x n, C is m x n. */
+enum { MPT_GEMM_F32 = 0 };
+typedef struct {
+    uint32_t dtype;       /* MPT_GEMM_F32 */
+    uint32_t trans_a;     /* 0 = N, 1 = T */
+    uint32_t trans_b;
+    uint32_t m, n, k;
+    uint32_t lda, ldb, ldc;
+    uint32_t batch;       /* >= 1; strided batched when > 1 */
+    float    alpha, beta;
+    uint64_t a, b, c;     /* device addresses */
+    uint64_t stride_a, stride_b, stride_c;  /* elements between batch entries */
+} mpt_gemm_desc;          /* 96 bytes */
 
 /* ---- PTX kernel signature returned by COMPILE_PTX ---------------------------------------- */
 #define MPT_MAX_PARAMS 64

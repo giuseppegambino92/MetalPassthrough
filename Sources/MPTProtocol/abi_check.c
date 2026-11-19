@@ -6,6 +6,8 @@ _Static_assert(sizeof(mpt_cqe) == 32, "cqe");
 _Static_assert(sizeof(mpt_hello) == 48, "hello");
 _Static_assert(sizeof(mpt_hello_ack) == 32, "hello_ack");
 _Static_assert(MPT_OP__COUNT <= 64, "opcodes");
+_Static_assert(sizeof(mpt_keeper_hello) == 32, "keeper hello");
+_Static_assert(sizeof(mpt_gemm_desc) == 96, "gemm desc");
 _Static_assert(sizeof(mpt_ring_header) == 5 * MPT_CACHELINE, "ring header");
 _Static_assert(offsetof(mpt_ring_header, sq_tail) == 128, "sq_tail line");
 _Static_assert(offsetof(mpt_ring_header, sq_head) == 256, "sq_head line");

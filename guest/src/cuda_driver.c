@@ -250,6 +250,9 @@ static inline uint32_t sid(CUstream s) {
     return (s == NULL || s == CU_STREAM_LEGACY || s == CU_STREAM_PER_THREAD) ? 0u : s->id;
 }
 
+/* For companion libraries (libcublas): MetalPassthrough stream id of a CUstream. */
+EXPORT uint32_t mpt_cuda_stream_id(CUstream s) { return sid(s); }
+
 /* Device range [d, d + n) must lie inside one live allocation (overflow-safe). */
 static void *dev_range(CUdeviceptr d, size_t n) {
     void *p = hp(d);

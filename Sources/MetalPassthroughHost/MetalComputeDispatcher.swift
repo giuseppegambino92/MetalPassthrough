@@ -20,6 +20,7 @@ import Darwin
 import Foundation
 import MPTProtocol
 import Metal
+import MetalPerformanceShaders
 
 @available(macOS 27.0, *)
 final class StreamState {
@@ -63,6 +64,10 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
     static let maxStringBytes: UInt64 = 64 << 20
     static let maxBindings: UInt32 = 64
     static let maxBindIndex: UInt32 = 30
+    /// A committed command buffer cannot be cancelled, so absurd launch sizes are rejected up front
+    /// (2^40 threads is far beyond any real workload). This does not prevent a guest from occupying
+    /// the GPU with a kernel that never terminates.
+    static let maxThreadsPerDispatch: UInt64 = 1 << 40
 
     let sessionID: UInt32
     let device: MTLDevice
@@ -499,6 +504,9 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
                 ok(idle ? 1 : 0)
             case Int(MPT_OP_EVENT_RECORD):
                 let s = try streamOf(e)
+                // The completion is published with an atomic store: misaligned addresses would fault
+                // (EXC_ARM_DA_ALIGN) and take the host down, so alignment is part of validation.
+                guard e.a.0 % 16 == 0 else { throw OpError.invalid("event address 0x\(String(e.a.0, radix: 16)) not 16-byte aligned") }
                 let p = try arenas.pointer(e.a.0, UInt64(MemoryLayout<mpt_event>.size))
                 let addr = UInt(bitPattern: p)
                 var entry = events[e.a.0] ?? (device.makeSharedEvent()!, 0)
@@ -520,6 +528,10 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
                     prepare(s)
                     encodeWait(s, entry.event, entry.value)
                 }
+                ok()
+            case Int(MPT_OP_GEMM):
+                let s = try streamOf(e)
+                try gemm(e, on: s)
                 ok()
             case Int(MPT_OP_EVENT_DESTROY):
                 events.removeValue(forKey: e.a.0)
@@ -608,10 +620,20 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
             }
             let tgs = [Int(max(d.tg.0, 1)), Int(max(d.tg.1, 1)), Int(max(d.tg.2, 1))]
             let grid = [Int(max(d.grid.0, 1)), Int(max(d.grid.1, 1)), Int(max(d.grid.2, 1))]
+            // Per-dimension limits first: only then is the threadgroup product small enough to compute.
             let maxTG = device.maxThreadsPerThreadgroup
-            guard tgs[0] * tgs[1] * tgs[2] <= ps.maxTotalThreadsPerThreadgroup, tgs[0] <= maxTG.width, tgs[1] <= maxTG.height,
-                tgs[2] <= maxTG.depth
+            guard tgs[0] <= maxTG.width, tgs[1] <= maxTG.height, tgs[2] <= maxTG.depth,
+                tgs[0] * tgs[1] * tgs[2] <= ps.maxTotalThreadsPerThreadgroup
             else { throw OpError.invalid("threadgroup \(tgs) exceeds pipeline limit \(ps.maxTotalThreadsPerThreadgroup)") }
+            // Overflow-safe: guest-controlled grid factors can exceed 2^64 when multiplied.
+            var total: UInt64 = 1
+            var overflow = false
+            for f in grid + (d.mode == MPT_DISPATCH_THREADS ? [] : [tgs[0] * tgs[1] * tgs[2]]) {
+                let (v, o) = total.multipliedReportingOverflow(by: UInt64(f))
+                total = v
+                overflow = overflow || o
+            }
+            guard !overflow, total <= Self.maxThreadsPerDispatch else { throw OpError.invalid("dispatch geometry \(grid) x \(tgs) too large") }
             var tgMemTotal = ps.staticThreadgroupMemoryLength
             // Validate every binding before encoding anything.
             var plan: [(kind: UInt32, index: Int, arena: GuestArena?, off: Int, len: Int)] = []
@@ -661,6 +683,56 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
         statLock.withLock { stats.dispatches &+= 1 }
     }
 
+    /// BLAS (column-major) SGEMM through MPSMatrixMultiplication. A column-major matrix with leading
+    /// dimension ld is the row-major transpose with rowBytes = ld * 4, so C^T = op(B)^T * op(A)^T is
+    /// computed in MPS's row-major world without moving data.
+    private func gemm(_ e: mpt_sqe, on s: StreamState) throws {
+        let size = UInt64(MemoryLayout<mpt_gemm_desc>.size)
+        guard e.a.1 == size else { throw OpError.invalid("gemm descriptor of \(e.a.1) bytes") }
+        let g = try arenas.pointer(e.a.0, size).loadUnaligned(as: mpt_gemm_desc.self)
+        guard g.dtype == MPT_GEMM_F32, g.trans_a <= 1, g.trans_b <= 1, g.batch >= 1, g.batch <= 65536,
+            g.m >= 1, g.n >= 1, g.k >= 1, g.m <= 1 << 20, g.n <= 1 << 20, g.k <= 1 << 20
+        else { throw OpError.invalid("gemm shape m=\(g.m) n=\(g.n) k=\(g.k) batch=\(g.batch)") }
+        let (m, n, k) = (Int(g.m), Int(g.n), Int(g.k))
+        // Row-major views (rows x cols, row stride ld) of the column-major operands.
+        let left = g.trans_b == 0 ? (rows: n, cols: k, ld: Int(g.ldb)) : (rows: k, cols: n, ld: Int(g.ldb))
+        let right = g.trans_a == 0 ? (rows: k, cols: m, ld: Int(g.lda)) : (rows: m, cols: k, ld: Int(g.lda))
+        let result = (rows: n, cols: m, ld: Int(g.ldc))
+        func view(_ dev: UInt64, _ v: (rows: Int, cols: Int, ld: Int), _ stride: UInt64) throws -> (GuestArena, Int) {
+            guard v.ld >= v.cols else { throw OpError.invalid("leading dimension \(v.ld) < \(v.cols)") }
+            let span = UInt64((v.rows - 1) * v.ld + v.cols) * 4
+            let (lastOff, o1) = (stride * 4).multipliedReportingOverflow(by: UInt64(g.batch - 1))
+            let (total, o2) = span.addingReportingOverflow(lastOff)
+            guard !o1, !o2, dev % 4 == 0 else { throw OpError.invalid("gemm operand range") }
+            return try arenas.resolve(dev, total)
+        }
+        let (aL, oL) = try view(g.b, left, g.stride_b)
+        let (aR, oR) = try view(g.a, right, g.stride_a)
+        let (aC, oC) = try view(g.c, result, g.stride_c)
+        let mm = MPSMatrixMultiplication(
+            device: device, transposeLeft: g.trans_b == 1, transposeRight: g.trans_a == 1,
+            resultRows: n, resultColumns: m, interiorColumns: k, alpha: Double(g.alpha), beta: Double(g.beta))
+        func desc(_ v: (rows: Int, cols: Int, ld: Int), _ stride: UInt64) -> MPSMatrixDescriptor {
+            MPSMatrixDescriptor(rows: v.rows, columns: v.cols, matrices: Int(g.batch), rowBytes: v.ld * 4,
+                                matrixBytes: Int(stride) * 4, dataType: .float32)
+        }
+        // MPS encodes its own passes, which our per-stream fence cannot order (fences order the encoders
+        // that wait on them, and the arena buffers are untracked). A command-buffer boundary does:
+        // earlier work completes first (progress event), and later work waits for the GEMM.
+        prepare(s)
+        if s.hasOpenWork { commit(s) }
+        let cb = openCB(s)
+        mm.batchSize = Int(g.batch)
+        mm.encode(
+            commandBuffer: cb,
+            leftMatrix: MPSMatrix(buffer: aL.buffer, offset: aL.bufferOffset + oL, descriptor: desc(left, g.stride_b)),
+            rightMatrix: MPSMatrix(buffer: aR.buffer, offset: aR.bufferOffset + oR, descriptor: desc(right, g.stride_a)),
+            resultMatrix: MPSMatrix(buffer: aC.buffer, offset: aC.bufferOffset + oC, descriptor: desc(result, g.stride_c)))
+        s.batched += 1
+        statLock.withLock { stats.dispatches &+= 1 }
+        commit(s)
+    }
+
     private func fill(_ e: mpt_sqe, on s: StreamState) throws {
         let width = e.a.3
         guard width == 1 || width == 2 || width == 4, e.a.1 % width == 0 else {
@@ -700,7 +772,7 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
         let flags = UInt32(truncatingIfNeeded: e.a.4)
         let infoSize = UInt64(MemoryLayout<mpt_kernel_info>.size)
         let outLen = e.a.6
-        guard outLen >= infoSize + 1, outLen <= Self.maxStringBytes else { throw ArenaError.outOfRange(e.a.5, outLen) }
+        guard outLen >= infoSize + 1, outLen <= Self.maxStringBytes, e.a.5 % 8 == 0 else { throw ArenaError.outOfRange(e.a.5, outLen) }
         let out = try arenas.pointer(e.a.5, outLen)
         memset(out, 0, Int(infoSize))
         func logText(_ s: String) { writeLog(e.a.5 + infoSize, outLen - infoSize, s) }

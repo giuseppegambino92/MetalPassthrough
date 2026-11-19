@@ -74,6 +74,22 @@ public final class MetalPassthroughServer: @unchecked Sendable {
     private let lock = NSLock()
     private var nextSession: UInt32 = 1
 
+    /// Keeper bookkeeping per session: the keeper connection is released only after the session's
+    /// GPU work has drained and its arenas are unmapped (crash-safe teardown).
+    private final class KeeperLink {
+        let nonce: [UInt8]
+        var fd: Int32 = -1
+        var ended = false
+        init(nonce: [UInt8]) { self.nonce = nonce }
+    }
+    private var keepers: [UInt32: KeeperLink] = [:]
+
+    private static func release(_ fd: Int32) {
+        var b: UInt8 = 1
+        _ = Darwin.write(fd, &b, 1)
+        Darwin.close(fd)
+    }
+
     public init(memory: GuestMemoryDevice, guestMemoryBytes: UInt64, containerID: String, verbose: Bool = false) throws {
         guard let d = MTLCreateSystemDefaultDevice() else { throw CompileError.pipeline("no Metal device") }
         device = d
@@ -89,6 +105,28 @@ public final class MetalPassthroughServer: @unchecked Sendable {
         if options.verbose { FileHandle.standardError.write("[metalpassthrough] \(s)\n".data(using: .utf8)!) }
     }
 
+    /// Keeper connection: authenticate, then park its fd until the session has fully drained.
+    func serveKeeper(_ s: FDStream) throws {
+        var k = mpt_keeper_hello()
+        k.magic = MPT_KEEPER_MAGIC
+        try withUnsafeMutableBytes(of: &k) { try s.readExact($0.baseAddress!.advanced(by: 4), $0.count - 4) }
+        let nonce = withUnsafeBytes(of: k.nonce) { Array($0) }
+        let fd = dup(s.fd)  // the accept thread closes its own descriptor
+        Self.setReadTimeout(fd, seconds: 0)
+        let action: (release: Bool, accepted: Bool) = lock.withLock {
+            guard let link = keepers[k.session_id], link.nonce == nonce, link.fd < 0 else { return (false, false) }
+            if link.ended { return (true, true) }
+            link.fd = fd
+            return (false, true)
+        }
+        if !action.accepted {
+            log("keeper for session \(k.session_id) rejected (unknown session or bad nonce)")
+            Darwin.close(fd)
+        } else if action.release {
+            Self.release(fd)
+        }
+    }
+
     /// Accepts a connected stream (vsock or unix). Takes ownership of the FileHandle.
     public func accept(_ conn: FileHandle) {
         let t = Thread { [self] in
@@ -102,9 +140,21 @@ public final class MetalPassthroughServer: @unchecked Sendable {
         t.start()
     }
 
+    /// Bounds how long a peer may take to send its handshake (a partial hello must not pin a host
+    /// thread forever). Cleared once the session is established.
+    private static func setReadTimeout(_ fd: Int32, seconds: Int) {
+        var tv = timeval(tv_sec: seconds, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
     func serve(_ s: FDStream) throws {
+        Self.setReadTimeout(s.fd, seconds: 5)
+        var magic: UInt32 = 0
+        try withUnsafeMutableBytes(of: &magic) { try s.readExact($0.baseAddress!, 4) }
+        if magic == MPT_KEEPER_MAGIC { try serveKeeper(s); return }
         var hello = mpt_hello()
-        try withUnsafeMutableBytes(of: &hello) { try s.readExact($0.baseAddress!, $0.count) }
+        hello.magic = magic
+        try withUnsafeMutableBytes(of: &hello) { try s.readExact($0.baseAddress!.advanced(by: 4), $0.count - 4) }
         func reply(_ status: Int32, _ base: UInt64 = 0, _ sid: UInt32 = 0, _ caps: UInt64 = 0) throws {
             var ack = mpt_hello_ack(magic: MPT_MAGIC, status: status, gpu_base: base, session_id: sid, arena_id: 0, caps: caps)
             try withUnsafeBytes(of: &ack) { try s.writeAll($0.baseAddress!, $0.count) }
@@ -152,7 +202,20 @@ public final class MetalPassthroughServer: @unchecked Sendable {
             registry: registry, options: options)
         registry.opened(.init(session: sid, pid: hello.pid, comm: comm, arenaBytes: UInt64(arena0.length)))
         defer { registry.closed(sid) }
-        try reply(0, arena0.gpuBase, sid, MPT_CAP_STREAMS | (arena0.unifiedAddressable ? MPT_CAP_UVA : 0))
-        disp.run()
+        let link = KeeperLink(nonce: nonce)
+        lock.withLock { keepers[sid] = link }
+        try reply(0, arena0.gpuBase, sid, MPT_CAP_STREAMS | MPT_CAP_KEEPER | (arena0.unifiedAddressable ? MPT_CAP_UVA : 0))
+        Self.setReadTimeout(s.fd, seconds: 0)  // established: the doorbell may legitimately stay idle
+        disp.run()  // returns only after all GPU work drained and the arenas were unmapped
+        let fd = lock.withLock { () -> Int32 in
+            link.ended = true
+            keepers.removeValue(forKey: sid)
+            defer { link.fd = -1 }
+            return link.fd
+        }
+        if fd >= 0 {
+            Self.release(fd)
+            log("session \(sid): GPU drained, keeper released (guest may now reuse the hugepages)")
+        }
     }
 }

@@ -20,7 +20,7 @@ let package = Package(
                 "MPTProtocol",
                 .product(name: "Containerization", package: "containerization"),
             ],
-            linkerSettings: [.linkedFramework("Metal"), .linkedFramework("Virtualization")]
+            linkerSettings: [.linkedFramework("Metal"), .linkedFramework("MetalPerformanceShaders"), .linkedFramework("Virtualization")]
         ),
         .executableTarget(
             name: "mpt-run",

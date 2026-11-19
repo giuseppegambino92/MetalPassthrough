@@ -7,7 +7,7 @@ CFLAGS  ?= -O2 -g
 CFLAGS  += -fPIC -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Iinclude -I../include -fvisibility=hidden -D_GNU_SOURCE
 DIST    := dist
 
-LIBS := $(DIST)/lib/libmetalpassthrough.so.1 $(DIST)/lib/libcuda.so.1 $(DIST)/lib/libcudart.so.12
+LIBS := $(DIST)/lib/libmetalpassthrough.so.1 $(DIST)/lib/libcuda.so.1 $(DIST)/lib/libcudart.so.12 $(DIST)/lib/libcublas.so.12
 BINS := $(DIST)/bin/mpt-selftest $(DIST)/bin/apple-smi
 
 all: $(LIBS) $(BINS) headers python
@@ -28,6 +28,12 @@ $(DIST)/lib/libcudart.so.12: src/cuda_runtime.c src/fatbin.h src/libcudart.map $
 	$(CC) $(CFLAGS) -I$(CUDA)/include -shared -Wl,-soname,libcudart.so.12 -Wl,--version-script=src/libcudart.map -o $@ src/cuda_runtime.c \
 	    -L$(DIST)/lib -lcuda -lmetalpassthrough -Wl,-rpath,'$$ORIGIN' -lpthread
 	ln -sf libcudart.so.12 $(DIST)/lib/libcudart.so
+
+# cuBLAS subset (SGEMM via host MPS, level-1 via Metal kernels), against the official <cublas_v2.h>.
+$(DIST)/lib/libcublas.so.12: src/cublas.c src/libcublas.map $(DIST)/lib/libcuda.so.1
+	$(CC) $(CFLAGS) -I$(CUDA)/include -shared -Wl,-soname,libcublas.so.12 -Wl,--version-script=src/libcublas.map -o $@ src/cublas.c \
+	    -L$(DIST)/lib -lcuda -lmetalpassthrough -Wl,-rpath,'$$ORIGIN' -lm
+	ln -sf libcublas.so.12 $(DIST)/lib/libcublas.so
 
 $(DIST)/bin/mpt-selftest: tests/selftest.c $(DIST)/lib/libmetalpassthrough.so.1
 	@mkdir -p $(@D)

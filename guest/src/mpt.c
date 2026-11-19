@@ -21,9 +21,21 @@
 #include <time.h>
 #include <unistd.h>
 #include <linux/vm_sockets.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 
 #ifndef MAP_HUGETLB
 #define MAP_HUGETLB 0x40000
+#endif
+#ifndef MFD_HUGETLB
+#define MFD_HUGETLB 0x0004U
+#endif
+#ifndef MFD_HUGE_2MB
+#define MFD_HUGE_2MB (21U << 26)
+#endif
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
 #endif
 
 #define MPT_MAX_ARENAS 64
@@ -61,6 +73,7 @@ struct mpt_ctx {
     int uva;                         /* every arena satisfies guest VA == device address */
     int closed;                      /* session ended (process exit); calls fail with EPROTO */
     uint64_t caps;                   /* MPT_CAP_* negotiated at HELLO */
+    int keeper;                      /* fd-passing socket to the keeper process, or -1 */
     pthread_mutex_t lock;            /* serializes ring submission */
     atomic_flag alock;               /* allocator spinlock */
 };
@@ -147,9 +160,22 @@ static void drain(int fd) {
 
 /* ------------------------------------------------------------------ hugepage arenas */
 
-static void *map_chunks(uint32_t n, uint8_t nonce[16]) {
+/* Maps n hugepage chunks. Prefers a hugetlb memfd (so the keeper process can hold the pages past
+ * the client's death); falls back to an anonymous MAP_HUGETLB mapping. *memfd = -1 on fallback. */
+static void *map_chunks(uint32_t n, uint8_t nonce[16], int *memfd) {
     size_t len = (size_t)n * MPT_CHUNK_SIZE;
-    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0);
+    void *p = MAP_FAILED;
+    *memfd = -1;
+    if (!getenv("METALPASSTHROUGH_NO_KEEPER")) {
+        int fd = (int)syscall(SYS_memfd_create, "metalpassthrough-arena", MFD_HUGETLB | MFD_HUGE_2MB | MFD_CLOEXEC);
+        if (fd >= 0) {
+            if (ftruncate(fd, (off_t)len) == 0)
+                p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+            if (p == MAP_FAILED) close(fd); else *memfd = fd;
+        }
+    }
+    if (p == MAP_FAILED)
+        p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0);
     if (p == MAP_FAILED) return NULL;
     /* Children must not inherit (and COW-split) pages the host GPU addresses physically. */
     madvise(p, len, MADV_DONTFORK);
@@ -157,13 +183,90 @@ static void *map_chunks(uint32_t n, uint8_t nonce[16]) {
         for (int i = 0; i < 16; i++) nonce[i] = (uint8_t)(rand() ^ (now_ns() >> (i * 3)));
     }
     for (uint32_t i = 0; i < n; i++) {
-        mpt_chunk_stamp *s = (mpt_chunk_stamp *)((uint8_t *)p + (size_t)i * MPT_CHUNK_SIZE);
-        memcpy(s->nonce, nonce, 16);
-        s->index = i;
-        s->count = n;
+        mpt_chunk_stamp *st = (mpt_chunk_stamp *)((uint8_t *)p + (size_t)i * MPT_CHUNK_SIZE);
+        memcpy(st->nonce, nonce, 16);
+        st->index = i;
+        st->count = n;
     }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     return p;
+}
+
+/* ------------------------------------------------------------------ keeper (crash-safe teardown)
+ * A grandchild process that holds the arena memfds and a vsock connection to the host. If the client
+ * dies with GPU work in flight, the hugepages stay allocated (to the keeper) until the host has
+ * drained the GPU, unmapped the arenas and released the keeper. Runs only async-signal-safe code. */
+
+#define KEEP_KFD 200
+#define KEEP_PAIR 201
+#define KEEP_MEM0 202
+
+static void keeper_main(int kfd, int pair, int memfd) {
+    setsid();  /* leave the client's process group: terminal signals must not kill the keeper */
+    dup2(kfd, KEEP_KFD);
+    dup2(pair, KEEP_PAIR);
+    if (memfd >= 0) dup2(memfd, KEEP_MEM0);
+    int null = open("/dev/null", O_RDWR);
+    if (null >= 0) { dup2(null, 0); dup2(null, 1); dup2(null, 2); }
+    if (syscall(SYS_close_range, 3, KEEP_KFD - 1, 0) != 0)
+        for (int fd = 3; fd < KEEP_KFD; fd++) close(fd);
+    if (syscall(SYS_close_range, KEEP_MEM0 + 1, ~0U, 0) != 0)
+        for (int fd = KEEP_MEM0 + 1; fd < 4096; fd++) close(fd);
+    struct pollfd pf[2] = { { .fd = KEEP_KFD, .events = POLLIN }, { .fd = KEEP_PAIR, .events = POLLIN } };
+    for (;;) {
+        int n = poll(pf, 2, -1);
+        if (n < 0) { if (errno == EINTR) continue; _exit(1); }
+        if (pf[0].revents) _exit(0);  /* host released us (or the host went away): pages may be reused */
+        if (pf[1].revents) {
+            char data;
+            char cbuf[CMSG_SPACE(sizeof(int))];
+            struct iovec iov = { .iov_base = &data, .iov_len = 1 };
+            struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof cbuf };
+            ssize_t r = recvmsg(KEEP_PAIR, &m, 0);
+            if (r <= 0) { close(KEEP_PAIR); pf[1].fd = -1; continue; }  /* client gone: keep holding */
+            /* Received memfds simply stay open in this process: holding the fd holds the pages. */
+        }
+    }
+}
+
+/* Starts the keeper for a freshly established session. Returns the client end of the fd-passing
+ * socket (or -1 when the keeper is unavailable; the session still works, without crash safety). */
+static int start_keeper(uint32_t session, const uint8_t nonce[16], int memfd0) {
+    if (getenv("METALPASSTHROUGH_NO_KEEPER") || memfd0 < 0) return -1;
+    int kfd = connect_host();
+    if (kfd < 0) return -1;
+    mpt_keeper_hello kh = { .magic = MPT_KEEPER_MAGIC, .session_id = session };
+    memcpy(kh.nonce, nonce, 16);
+    if (io_all(kfd, &kh, sizeof kh, 1)) { close(kfd); return -1; }
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sp) != 0) { close(kfd); return -1; }
+    pid_t child = fork();
+    if (child < 0) { close(kfd); close(sp[0]); close(sp[1]); return -1; }
+    if (child == 0) {  /* intermediate child: detach the keeper so init reaps it */
+        pid_t k = fork();
+        if (k == 0) keeper_main(kfd, sp[1], memfd0);
+        _exit(k < 0);
+    }
+    int st;
+    while (waitpid(child, &st, 0) < 0 && errno == EINTR) {}
+    close(kfd);
+    close(sp[1]);
+    return sp[0];
+}
+
+static void keeper_hold(int pair, int memfd) {
+    if (pair < 0 || memfd < 0) return;
+    char data = 'M';
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    memset(cbuf, 0, sizeof cbuf);
+    struct iovec iov = { .iov_base = &data, .iov_len = 1 };
+    struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof cbuf };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &memfd, sizeof(int));
+    (void)!sendmsg(pair, &m, MSG_NOSIGNAL);
 }
 
 /* Unified virtual addressing: move the hugepage mapping so that guest VA == device address. The host
@@ -504,7 +607,8 @@ static int grow(mpt_ctx *c, uint64_t min_bytes) {
     }
     if (atomic_load(&c->narenas) >= MPT_MAX_ARENAS) return set_err(MPT_ENOMEM, "arena table full");
     uint8_t nonce[16];
-    uint8_t *base = map_chunks(nchunks, nonce);
+    int memfd;
+    uint8_t *base = map_chunks(nchunks, nonce, &memfd);
     if (!base) return set_err(MPT_ENOMEM, "mmap(MAP_HUGETLB, %u x 2 MiB) failed: %s", nchunks, strerror(errno));
     mpt_sqe e = { .opcode = MPT_OP_ALLOC_ARENA };
     memcpy(&e.a[0], nonce, 8);
@@ -512,7 +616,13 @@ static int grow(mpt_ctx *c, uint64_t min_bytes) {
     e.a[2] = nchunks;
     mpt_cqe q;
     int r = submit(c, &e, &q);
-    if (r) { munmap(base, (size_t)nchunks * MPT_CHUNK_SIZE); return set_err(r, "ALLOC_ARENA failed: %s", mpt_strerror(r)); }
+    if (r) {
+        munmap(base, (size_t)nchunks * MPT_CHUNK_SIZE);
+        if (memfd >= 0) close(memfd);
+        return set_err(r, "ALLOC_ARENA failed: %s", mpt_strerror(r));
+    }
+    keeper_hold(c->keeper, memfd);
+    if (memfd >= 0) close(memfd);
     int uva = 0;
     base = relocate_uva(base, (size_t)nchunks * MPT_CHUNK_SIZE, q.r[1], q.r[2], &uva);
     alock(c);
@@ -543,7 +653,9 @@ MPT_API int mpt_open(mpt_ctx **out, size_t arena_bytes) {
     atomic_flag_clear(&c->alock);
 
     uint8_t nonce[16];
-    uint8_t *base = map_chunks(nchunks, nonce);
+    int memfd0;
+    uint8_t *base = map_chunks(nchunks, nonce, &memfd0);
+    c->keeper = -1;
     if (!base) {
         int e = errno;
         free(c);
@@ -555,6 +667,7 @@ MPT_API int mpt_open(mpt_ctx **out, size_t arena_bytes) {
     int fd = connect_host();
     if (fd < 0) {
         munmap(base, (size_t)nchunks * MPT_CHUNK_SIZE);
+        if (memfd0 >= 0) close(memfd0);
         free(c);
         return set_err(MPT_EPROTO, "cannot reach the MetalPassthrough host (vsock cid 2 port %u): %s",
                        (unsigned)env_u64("METALPASSTHROUGH_PORT", MPT_VSOCK_PORT), strerror(-fd));
@@ -568,12 +681,14 @@ MPT_API int mpt_open(mpt_ctx **out, size_t arena_bytes) {
     if (io_all(fd, &h, sizeof h, 1) || io_all(fd, &ack, sizeof ack, 0) || ack.magic != MPT_MAGIC) {
         close(fd);
         munmap(base, (size_t)nchunks * MPT_CHUNK_SIZE);
+        if (memfd0 >= 0) close(memfd0);
         free(c);
         return set_err(MPT_EPROTO, "MetalPassthrough handshake failed");
     }
     if (ack.status) {
         close(fd);
         munmap(base, (size_t)nchunks * MPT_CHUNK_SIZE);
+        if (memfd0 >= 0) close(memfd0);
         free(c);
         return set_err(ack.status, "host rejected session: %s", mpt_strerror(ack.status));
     }
@@ -585,6 +700,7 @@ MPT_API int mpt_open(mpt_ctx **out, size_t arena_bytes) {
     if (__atomic_load_n(&c->ring->magic, __ATOMIC_ACQUIRE) != MPT_MAGIC || c->ring->sq_depth != MPT_SQ_DEPTH) {
         close(fd);
         munmap(base, (size_t)nchunks * MPT_CHUNK_SIZE);
+        if (memfd0 >= 0) close(memfd0);
         free(c);
         return set_err(MPT_EPROTO, "ring header not initialized by host");
     }
@@ -594,8 +710,10 @@ MPT_API int mpt_open(mpt_ctx **out, size_t arena_bytes) {
     c->scratch_dev = ack.gpu_base + MPT_SCRATCH_OFFSET;
     arena_init(&c->arenas[0], base, (uint64_t)nchunks * MPT_CHUNK_SIZE, ack.gpu_base, 0, MPT_HEAP_OFFSET);
     atomic_store(&c->narenas, 1);
-    DBG(c, "session %u: arena0 %u MiB zero-copy, gpu base 0x%llx, uva=%d, handshake %.1f us", c->session, nchunks * 2,
-        (unsigned long long)ack.gpu_base, c->uva, (now_ns() - t0) / 1e3);
+    if (ack.caps & MPT_CAP_KEEPER) c->keeper = start_keeper(c->session, nonce, memfd0);
+    if (memfd0 >= 0) close(memfd0);  /* the keeper holds its own reference */
+    DBG(c, "session %u: arena0 %u MiB zero-copy, gpu base 0x%llx, uva=%d, keeper=%s, handshake %.1f us", c->session,
+        nchunks * 2, (unsigned long long)ack.gpu_base, c->uva, c->keeper >= 0 ? "yes" : "no", (now_ns() - t0) / 1e3);
     *out = c;
     return 0;
 }
@@ -605,6 +723,7 @@ MPT_API void mpt_close(mpt_ctx *c) {
     mpt_sqe e = { .opcode = MPT_OP_CLOSE };
     submit(c, &e, NULL);  /* host drains the GPU before acknowledging */
     close(c->fd);
+    if (c->keeper >= 0) close(c->keeper);
     uint32_t n = atomic_load(&c->narenas);
     for (uint32_t i = 0; i < n; i++) {
         munmap(c->arenas[i].base, c->arenas[i].len);
@@ -649,6 +768,19 @@ MPT_API size_t mpt_abi_sizeof(const char *type) {
     return 0;
 }
 MPT_API int mpt_unified_addressing(mpt_ctx *c) { return c->uva; }
+MPT_API int mpt_crash_safe(mpt_ctx *c) { return c->keeper >= 0; }
+
+/* Test/fuzzing hooks: submit an arbitrary SQE (waits for its CQE unless MPT_F_NO_CQE), and expose
+ * the ring so robustness tests can violate the protocol on purpose. Not for applications. */
+MPT_API int mpt_submit_raw(mpt_ctx *c, const mpt_sqe *e, mpt_cqe *out) {
+    mpt_sqe copy = *e;
+    return submit(c, &copy, out);
+}
+MPT_API mpt_ring_header *mpt_debug_ring(mpt_ctx *c) { return c->ring; }
+MPT_API uint64_t mpt_debug_arena_range(mpt_ctx *c, uint64_t *len) {
+    if (len) *len = c->arenas[0].len;
+    return c->arenas[0].gpu_base;
+}
 
 MPT_API const mpt_device_info *mpt_device(mpt_ctx *c) {
     return (const mpt_device_info *)(c->arenas[0].base + MPT_INFO_OFFSET);
@@ -819,6 +951,23 @@ MPT_API int mpt_fill(mpt_ctx *c, uint64_t dst, uint64_t len, uint32_t pattern, u
 }
 
 MPT_API int mpt_flush(mpt_ctx *c) { return simple(c, MPT_OP_FLUSH, MPT_F_NO_CQE, 0, 0, 0, 0, NULL); }
+
+/* Host-library SGEMM (MPSMatrixMultiplication) on arena memory, stream ordered. The descriptor
+ * travels in the reserved SQ slot's scratch area, which stays valid until the host consumed it. */
+MPT_API int mpt_gemm_on(mpt_ctx *c, uint32_t stream, const mpt_gemm_desc *g) {
+    if (c->closed) return MPT_EPROTO;
+    pthread_mutex_lock(&c->lock);
+    uint32_t slot = sq_reserve(c);
+    uint8_t *desc = c->scratch + (size_t)slot * MPT_SCRATCH_PER_SLOT;
+    memcpy(desc, g, sizeof *g);
+    mpt_sqe e = { .opcode = MPT_OP_GEMM, .flags = (uint16_t)(MPT_F_NO_CQE | mpt_stream_flags(stream)) };
+    e.a[0] = c->scratch_dev + (uint64_t)slot * MPT_SCRATCH_PER_SLOT;
+    e.a[1] = sizeof *g;
+    int r = submit_locked(c, &e, NULL);
+    c->pending = 1;
+    pthread_mutex_unlock(&c->lock);
+    return r;
+}
 
 /* Takes the sticky asynchronous error, if any (CUDA reports async failures at the next sync). */
 static int take_sticky(mpt_ctx *c, int r) {

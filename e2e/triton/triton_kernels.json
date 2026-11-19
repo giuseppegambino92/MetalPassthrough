@@ -1,0 +1,12 @@
+{
+ "add_kernel": {
+  "name": "add_kernel",
+  "num_warps": 4,
+  "shared": 0
+ },
+ "softmax_kernel": {
+  "name": "softmax_kernel",
+  "num_warps": 4,
+  "shared": 16
+ }
+}

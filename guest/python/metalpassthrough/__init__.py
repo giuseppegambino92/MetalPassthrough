@@ -33,7 +33,7 @@ import numpy as np
 
 __all__ = [
     "device", "stats", "empty", "zeros", "zeros_like", "empty_like", "asarray", "is_device_array",
-    "device_address", "synchronize", "flush", "Kernel", "PTXKernel", "metal_kernel", "ptx_kernel",
+    "device_address", "synchronize", "flush", "matmul", "Kernel", "PTXKernel", "metal_kernel", "ptx_kernel",
     "unified_addressing", "ping", "memory_info", "MetalPassthroughError",
 ]
 __version__ = "0.1.0"
@@ -108,6 +108,12 @@ class _Arg(_c.Structure):
     _fields_ = [("kind", _u32), ("index", _u32), ("ptr", _vp), ("len", _u64)]
 
 
+class _GemmDesc(_c.Structure):
+    _fields_ = [("dtype", _u32), ("trans_a", _u32), ("trans_b", _u32), ("m", _u32), ("n", _u32), ("k", _u32),
+                ("lda", _u32), ("ldb", _u32), ("ldc", _u32), ("batch", _u32), ("alpha", _c.c_float), ("beta", _c.c_float),
+                ("a", _u64), ("b", _u64), ("c", _u64), ("stride_a", _u64), ("stride_b", _u64), ("stride_c", _u64)]
+
+
 class _KernelInfo(_c.Structure):
     _fields_ = [("nparams", _u32), ("params_bytes", _u32), ("shared_bytes", _u32), ("flags", _u32),
                 ("param_offset", _u32 * 64), ("param_size", _u32 * 64)]
@@ -124,6 +130,7 @@ _sigs = {
     "mpt_dispatch": ([_vp, _c.POINTER(_Pipeline), _c.POINTER(_u32), _c.POINTER(_u32), _u32, _c.POINTER(_Arg), _u32, _u32], _i32),
     "mpt_dispatch_raw": ([_vp, _c.POINTER(_Pipeline), _c.POINTER(_u32), _c.POINTER(_u32), _vp, _u32, _u32, _u32], _i32),
     "mpt_sync": ([_vp, _c.POINTER(_u64)], _i32), "mpt_flush": ([_vp], _i32),
+    "mpt_gemm_on": ([_vp, _u32, _c.POINTER(_GemmDesc)], _i32),
     "mpt_abi_sizeof": ([_cp], _sz),
 }
 for _n, (_a, _r) in _sigs.items():
@@ -269,6 +276,24 @@ def device_address(a: np.ndarray) -> int:
 
 def is_device_array(a) -> bool:
     return isinstance(a, np.ndarray) and a.size > 0 and device_address(a) != 0
+
+
+def matmul(a: np.ndarray, b: np.ndarray, out: Optional[np.ndarray] = None, alpha: float = 1.0, beta: float = 0.0) -> np.ndarray:
+    """out = alpha * a @ b + beta * out for float32 2-D arena arrays, on the host's Metal Performance
+    Shaders GEMM (zero-copy). Asynchronous: call synchronize() before reading `out`."""
+    if a.dtype != np.float32 or b.dtype != np.float32 or a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
+        raise ValueError("matmul expects 2-D float32 arrays with matching inner dimension")
+    M, K = a.shape
+    N = b.shape[1]
+    if out is None:
+        out = empty((M, N), np.float32)
+    for x in (a, b, out):
+        if not (is_device_array(x) and x.flags.c_contiguous):
+            raise ValueError("matmul operands must be C-contiguous MetalPassthrough arrays (mpt.asarray)")
+    # Row-major C = A B is column-major C^T = B^T A^T: BLAS m=N, n=M, k=K with A:=b (ld N), B:=a (ld K).
+    d = _GemmDesc(0, 0, 0, N, M, K, N, K, N, 1, alpha, beta, device_address(b), device_address(a), device_address(out), 0, 0, 0)
+    _check(_lib.mpt_gemm_on(_session(), 0, _c.byref(d)), "matmul")
+    return out
 
 
 def to_torch(a: np.ndarray):

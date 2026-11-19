@@ -53,6 +53,8 @@ MPT_API int mpt_ping(mpt_ctx *ctx, uint64_t *roundtrip_ns);
 MPT_API uint32_t mpt_session_id(mpt_ctx *ctx);
 /* 1 if every arena pointer is numerically equal to its device address (CUDA-style UVA). */
 MPT_API int mpt_unified_addressing(mpt_ctx *ctx);
+/* 1 if a keeper process guarantees the arena pages outlive in-flight GPU work if this process dies. */
+MPT_API int mpt_crash_safe(mpt_ctx *ctx);
 /* sizeof() of ABI structs by name, for bindings that mirror them (ctypes, Rust FFI). */
 MPT_API size_t mpt_abi_sizeof(const char *type);
 
@@ -100,6 +102,8 @@ MPT_API int mpt_dispatch_on(mpt_ctx *ctx, uint32_t stream, const mpt_pipeline *p
 MPT_API int mpt_dispatch_raw_on(mpt_ctx *ctx, uint32_t stream, const mpt_pipeline *p, const uint32_t grid[3],
                                 const uint32_t tg[3], const void *params, uint32_t params_len, uint32_t tg_memory, uint32_t flags);
 MPT_API int mpt_copy_on(mpt_ctx *ctx, uint32_t stream, uint64_t dst_dev, uint64_t src_dev, uint64_t len);
+/* SGEMM through the host's Metal Performance Shaders (column-major BLAS semantics). */
+MPT_API int mpt_gemm_on(mpt_ctx *ctx, uint32_t stream, const mpt_gemm_desc *desc);
 MPT_API int mpt_fill_on(mpt_ctx *ctx, uint32_t stream, uint64_t dst_dev, uint64_t len, uint32_t pattern, uint32_t width);
 
 /* GPU timestamp events (ev must be arena memory, e.g. from mpt_alloc). */
@@ -110,6 +114,11 @@ MPT_API int mpt_stream_wait_event(mpt_ctx *ctx, uint32_t stream, const mpt_event
 MPT_API int mpt_event_query(mpt_ctx *ctx, const mpt_event *ev);        /* 1 done, 0 pending; never blocks */
 MPT_API int mpt_event_wait(mpt_ctx *ctx, mpt_event *ev);
 MPT_API int mpt_event_destroy(mpt_ctx *ctx, mpt_event *ev);
+
+/* Test / fuzzing hooks (not for applications). */
+MPT_API int mpt_submit_raw(mpt_ctx *ctx, const mpt_sqe *sqe, mpt_cqe *out);
+MPT_API mpt_ring_header *mpt_debug_ring(mpt_ctx *ctx);
+MPT_API uint64_t mpt_debug_arena_range(mpt_ctx *ctx, uint64_t *len);
 
 #ifdef __cplusplus
 }
