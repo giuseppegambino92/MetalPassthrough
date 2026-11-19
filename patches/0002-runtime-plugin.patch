@@ -1,0 +1,63 @@
+From 6d879ef4f7b6a40e64d5f10dc33995288609d50c Mon Sep 17 00:00:00 2001
+From: Giuseppe Gambino <17169769+giuseppegambino92@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 08:52:44 +0100
+Subject: [PATCH] feat: install the runtime helper as a separate
+ MetalPassthrough runtime plugin
+
+- the helper's XPC label follows its executable (plugin) name, so the same
+  binary can be installed as container-runtime-metalpassthrough next to
+  the stock container-runtime-linux;
+- the MetalPassthrough attachment is enabled by --gpu or by selecting that
+  runtime with the stock CLI: container run --runtime container-runtime-metalpassthrough;
+- optional --label dev.metalpassthrough.gpu-memory-mb=N.
+---
+ .../RuntimeLinux/RuntimeLinuxHelper+Start.swift       |  6 +++++-
+ .../Services/RuntimeLinux/Server/RuntimeService.swift | 11 ++++++++---
+ 2 files changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/Sources/Plugins/RuntimeLinux/RuntimeLinuxHelper+Start.swift b/Sources/Plugins/RuntimeLinux/RuntimeLinuxHelper+Start.swift
+index 3a0ffab..f1537d9 100644
+--- a/Sources/Plugins/RuntimeLinux/RuntimeLinuxHelper+Start.swift
++++ b/Sources/Plugins/RuntimeLinux/RuntimeLinuxHelper+Start.swift
+@@ -28,7 +28,11 @@ import SystemPackage
+ 
+ extension RuntimeLinuxHelper {
+     struct Start: AsyncParsableCommand {
+-        static let label = "com.apple.container.runtime.container-runtime-linux"
++        /// The plugin loader registers `com.apple.container.runtime.<plugin name>.<uuid>`; deriving the
++        /// label from the executable name lets this same helper be installed as another runtime plugin
++        /// (e.g. container-runtime-metalpassthrough) next to the stock one.
++        static let label = "com.apple.container.runtime."
++            + (CommandLine.arguments.first.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "container-runtime-linux")
+ 
+         static let configuration = CommandConfiguration(
+             commandName: "start",
+diff --git a/Sources/Services/RuntimeLinux/Server/RuntimeService.swift b/Sources/Services/RuntimeLinux/Server/RuntimeService.swift
+index 577de8f..fd79c28 100644
+--- a/Sources/Services/RuntimeLinux/Server/RuntimeService.swift
++++ b/Sources/Services/RuntimeLinux/Server/RuntimeService.swift
+@@ -176,13 +176,18 @@ public actor RuntimeService {
+             // --gpu: reserve guest hugepages for the zero-copy arena and attach the MetalPassthrough
+             // virtio device + vsock endpoint (served from this runtime helper process).
+             var gpuAttachment: (any Sendable)?
+-            if config.gpu {
++            // Enabled by `--gpu` (patched CLI) or by selecting the MetalPassthrough runtime plugin with the
++            // stock CLI: `container run --runtime container-runtime-metalpassthrough ...`.
++            if config.gpu || config.runtimeHandler == "container-runtime-metalpassthrough" {
+                 guard #available(macOS 27.0, *) else {
+-                    throw ContainerizationError(.unsupported, message: "--gpu requires macOS 27 or newer")
++                    throw ContainerizationError(.unsupported, message: "MetalPassthrough requires macOS 27 or newer")
+                 }
++                // Optional GPU pool size: --label dev.metalpassthrough.gpu-memory-mb=N (default: half the VM memory).
++                let gpuMB = config.labels["dev.metalpassthrough.gpu-memory-mb"].flatMap { UInt64($0) }
+                 let gpu = try MetalPassthroughAttachment(
+                     containerID: config.id,
+-                    vmMemoryBytes: config.resources.memoryInBytes + VMResources.guestMemoryOverhead
++                    vmMemoryBytes: config.resources.memoryInBytes + VMResources.guestMemoryOverhead,
++                    gpuMemoryBytes: gpuMB.map { $0 << 20 }
+                 )
+                 kernel.commandLine.kernelArgs += gpu.kernelArgs
+                 gpuAttachment = gpu
+-- 
+2.54.0 (Apple Git-157)
+

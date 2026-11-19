@@ -153,9 +153,22 @@ static int io_all(int fd, void *buf, size_t n, int wr) {
     return 0;
 }
 
-static void drain(int fd) {
+/* Empties the doorbell socket. Returns -1 once the host closed it: Linux vsock reports a peer
+ * close as POLLIN + a 0-byte read, not necessarily POLLHUP. */
+static int drain(int fd) {
     uint8_t b[64];
-    while (recv(fd, b, sizeof b, MSG_DONTWAIT) > 0) {}
+    ssize_t n;
+    while ((n = recv(fd, b, sizeof b, MSG_DONTWAIT)) > 0) {}
+    return n == 0 ? -1 : 0;
+}
+
+/* Non-blocking: has the host ended this session? */
+static int host_gone(int fd) {
+    struct pollfd p = { .fd = fd, .events = POLLIN | POLLRDHUP };
+    if (poll(&p, 1, 0) <= 0) return 0;
+    if (p.revents & (POLLHUP | POLLERR | POLLRDHUP)) return 1;
+    uint8_t b;
+    return recv(fd, &b, 1, MSG_DONTWAIT | MSG_PEEK) == 0;
 }
 
 /* ------------------------------------------------------------------ hugepage arenas */
@@ -327,11 +340,17 @@ static void doorbell(mpt_ctx *c) {
     }
 }
 
-/* Reserves the next SQ slot (waits for space). Caller holds c->lock. */
+#define SQ_DEAD UINT32_MAX
+/* Reserves the next SQ slot (waits for space). Caller holds c->lock. Returns SQ_DEAD if the host
+ * ended the session while the SQ was full. */
 static uint32_t sq_reserve(mpt_ctx *c) {
-    while (c->sq_tail - atomic_load_explicit(RING_HEAD(c), memory_order_acquire) >= MPT_SQ_DEPTH) {
+    for (uint64_t spins = 0; c->sq_tail - atomic_load_explicit(RING_HEAD(c), memory_order_acquire) >= MPT_SQ_DEPTH; spins++) {
         doorbell(c);
         cpu_relax();
+        if ((spins & 0xffff) == 0xffff && host_gone(c->fd)) {
+            set_err(MPT_EPROTO, "host closed the MetalPassthrough session");
+            return SQ_DEAD;
+        }
     }
     return c->sq_tail % MPT_SQ_DEPTH;
 }
@@ -351,11 +370,11 @@ static int cq_wait(mpt_ctx *c, mpt_cqe *out) {
         /* Park on the doorbell socket. */
         atomic_store_explicit(RING_WAIT(c), 1, memory_order_seq_cst);
         if (atomic_load_explicit(RING_CQTAIL(c), memory_order_seq_cst) == c->cq_head) {
-            struct pollfd p = { .fd = c->fd, .events = POLLIN };
+            struct pollfd p = { .fd = c->fd, .events = POLLIN | POLLRDHUP };
             int r = poll(&p, 1, 1000);
             if (r > 0) {
-                if (p.revents & (POLLHUP | POLLERR)) { atomic_store(RING_WAIT(c), 0); return set_err(MPT_EPROTO, "host closed the MetalPassthrough session"); }
-                drain(c->fd);
+                if (p.revents & (POLLHUP | POLLERR | POLLRDHUP)) { atomic_store(RING_WAIT(c), 0); return set_err(MPT_EPROTO, "host closed the MetalPassthrough session"); }
+                if (drain(c->fd) < 0) { atomic_store(RING_WAIT(c), 0); return set_err(MPT_EPROTO, "host closed the MetalPassthrough session"); }
             }
         }
         atomic_store_explicit(RING_WAIT(c), 0, memory_order_seq_cst);
@@ -389,7 +408,7 @@ static int submit_locked(mpt_ctx *c, mpt_sqe *e, mpt_cqe *out) {
 static int submit(mpt_ctx *c, mpt_sqe *e, mpt_cqe *out) {
     if (c->closed) return MPT_EPROTO;
     pthread_mutex_lock(&c->lock);
-    sq_reserve(c);
+    if (sq_reserve(c) == SQ_DEAD) { pthread_mutex_unlock(&c->lock); return MPT_EPROTO; }
     int r = submit_locked(c, e, out);
     pthread_mutex_unlock(&c->lock);
     return r;
@@ -867,6 +886,7 @@ static int dispatch_common(mpt_ctx *c, uint32_t stream, const mpt_pipeline *p, c
     if (need > MPT_SCRATCH_PER_SLOT) return set_err(MPT_EINVAL, "dispatch descriptor too large (%zu bytes)", need);
     pthread_mutex_lock(&c->lock);
     uint32_t slot = sq_reserve(c);
+    if (slot == SQ_DEAD) { pthread_mutex_unlock(&c->lock); return MPT_EPROTO; }
     uint8_t *desc = c->scratch + (size_t)slot * MPT_SCRATCH_PER_SLOT;
     mpt_dispatch_desc *d = (mpt_dispatch_desc *)desc;
     for (int k = 0; k < 3; k++) { d->grid[k] = grid[k] ? grid[k] : 1; d->tg[k] = tg[k] ? tg[k] : 1; }
@@ -958,6 +978,7 @@ MPT_API int mpt_gemm_on(mpt_ctx *c, uint32_t stream, const mpt_gemm_desc *g) {
     if (c->closed) return MPT_EPROTO;
     pthread_mutex_lock(&c->lock);
     uint32_t slot = sq_reserve(c);
+    if (slot == SQ_DEAD) { pthread_mutex_unlock(&c->lock); return MPT_EPROTO; }
     uint8_t *desc = c->scratch + (size_t)slot * MPT_SCRATCH_PER_SLOT;
     memcpy(desc, g, sizeof *g);
     mpt_sqe e = { .opcode = MPT_OP_GEMM, .flags = (uint16_t)(MPT_F_NO_CQE | mpt_stream_flags(stream)) };
@@ -980,7 +1001,7 @@ MPT_API int mpt_sync(mpt_ctx *c, uint64_t *gpu_ns) {
     mpt_cqe q = { 0 };
     if (c->closed) return MPT_EPROTO;
     pthread_mutex_lock(&c->lock);
-    sq_reserve(c);
+    if (sq_reserve(c) == SQ_DEAD) { pthread_mutex_unlock(&c->lock); return MPT_EPROTO; }
     mpt_sqe e = { .opcode = MPT_OP_SYNC };
     int r = take_sticky(c, submit_locked(c, &e, &q));
     c->pending = 0;
@@ -1011,7 +1032,7 @@ MPT_API int mpt_stream_sync(mpt_ctx *c, uint32_t stream, uint64_t *gpu_ns) {
     mpt_cqe q = { 0 };
     if (c->closed) return MPT_EPROTO;
     pthread_mutex_lock(&c->lock);
-    sq_reserve(c);
+    if (sq_reserve(c) == SQ_DEAD) { pthread_mutex_unlock(&c->lock); return MPT_EPROTO; }
     mpt_sqe e = { .opcode = MPT_OP_STREAM_SYNC, .flags = mpt_stream_flags(stream) };
     int r = take_sticky(c, submit_locked(c, &e, &q));
     pthread_mutex_unlock(&c->lock);

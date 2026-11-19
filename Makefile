@@ -8,7 +8,7 @@ GUEST_DIR := $(HOME)/Library/Application Support/dev.metalpassthrough/guest
 PREFIX    ?= $(HOME)/.local
 CTR       := container run --rm -v $(CURDIR):/src
 
-.PHONY: all host guest images e2e ptx test test-all install uninstall patch clean help
+.PHONY: all host guest images e2e ptx test test-all bench install-plugin install uninstall patch clean help
 
 all: host guest e2e
 
@@ -18,7 +18,9 @@ help:
 	@echo "make guest       build libmetalpassthrough, libcuda.so.1, libcudart.so.12, apple-smi, python pkg"
 	@echo "make e2e         build the end-to-end test programs (CUDA driver/runtime, native Metal)"
 	@echo "make test        host unit tests (PTX->MSL translator on the local GPU)"
-	@echo "make test-all    unit tests + the 4 end-to-end tests inside real Linux containers"
+	@echo "make test-all    unit tests + end-to-end, robustness and workload tests inside real Linux containers"
+	@echo "make install-plugin  install as an apple/container runtime plugin: container run --runtime container-runtime-metalpassthrough"
+	@echo "make bench       reproducible native-vs-guest benchmark -> bench/results/RESULTS.md"
 	@echo "make install     install mpt-run to $(PREFIX)/bin and the guest runtime used by --gpu"
 	@echo "make patch       apply patches/ to vendor/container (apple/container 1.7.1) and build it"
 
@@ -37,7 +39,16 @@ e2e: guest
 	  gcc -O2 -o cuda/driver_test cuda/driver_test.c -I/usr/local/cuda/include -L/usr/local/cuda/lib64/stubs -lcuda -lm && \
 	  nvcc -O3 -cudart shared -o cuda/runtime_test cuda/runtime_test.cu && \
 	  nvcc -O3 -cudart shared -o cuda/semantics_test cuda/semantics_test.cu -lcuda && \
-	  gcc -O2 -o native/native_test native/native_test.c -I/src/guest/dist/include -L/src/guest/dist/lib -lmetalpassthrough -lm'
+	  gcc -O2 -o native/native_test native/native_test.c -I/src/guest/dist/include -L/src/guest/dist/lib -lmetalpassthrough -lm && \
+	  for p in cublas_gemm cg_solver attention; do nvcc -O3 -cudart shared -o apps/$$p apps/$$p.cu -L/src/guest/dist/lib -lcublas || exit 1; done && \
+	  for p in crash_test fuzz; do gcc -O2 -o robustness/$$p robustness/$$p.c -I/src/guest/dist/include -L/src/guest/dist/lib \
+	      -lmetalpassthrough -lm -Wl,-rpath,/usr/local/metalpassthrough/lib || exit 1; done'
+
+bench:
+	./bench/run.sh
+
+install-plugin:
+	./scripts/install-plugin.sh
 
 # Regenerates the nvcc PTX fixture (CUDA 13.5 toolkit, Debian 12 arm64).
 ptx:

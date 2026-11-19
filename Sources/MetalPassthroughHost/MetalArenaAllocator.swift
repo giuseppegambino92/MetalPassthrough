@@ -14,11 +14,12 @@ public final class GuestArena: @unchecked Sendable {
     public let region: RemappedGuestRegion
     public let buffer: MTLBuffer
     /// Byte offset of guest chunk 0 inside `buffer` (host-owned alignment padding before it).
-    public var bufferOffset: Int { region.prefix }
+    public let bufferOffset: Int
     /// Device address of guest chunk 0. 2 MiB aligned when unified addressing could be arranged.
-    public var gpuBase: UInt64 { buffer.gpuAddress + UInt64(region.prefix) }
-    public var length: Int { region.length - region.prefix }
-    public var base: UnsafeMutableRawPointer { region.base.advanced(by: region.prefix) }
+    /// (Stored: it is read on every dispatch and must not cost an Objective-C message.)
+    public let gpuBase: UInt64
+    public let length: Int
+    public let base: UnsafeMutableRawPointer
     public var unifiedAddressable: Bool { gpuBase % UInt64(MPT_CHUNK_SIZE) == 0 }
 
     /// Keeps the arena GPU-resident (page tables populated up front instead of on first dispatch).
@@ -29,6 +30,10 @@ public final class GuestArena: @unchecked Sendable {
         self.region = region
         self.buffer = buffer
         self.residency = residency
+        bufferOffset = region.prefix
+        gpuBase = buffer.gpuAddress + UInt64(region.prefix)
+        length = region.length - region.prefix
+        base = region.base.advanced(by: region.prefix)
     }
 
     @inline(__always) func contains(_ dev: UInt64, _ len: UInt64) -> Bool {

@@ -12,7 +12,10 @@ apple/container 1.7.1.*
 - **How it's zero-copy:** the GPU reads and writes the container's own physical memory pages.
 - **The ingredients:** a macOS 27 API (`VZCustomVirtioDevice.guestMemoryMapping`), 2 MiB hugepages,
   a predictable GPU address allocator, and a PTX-to-Metal compiler.
-- **The cost:** the same kernel runs at 98% of native speed from inside the VM.
+- **The cost:** identical GPU time to a native macOS process (measured side by side), plus
+  ~50–100 µs each time the guest waits for a result.
+- **How to use it:** with the stock Homebrew `container`, as a runtime plugin:
+  `container run --runtime container-runtime-metalpassthrough …`.
 
 ---
 
@@ -201,26 +204,82 @@ built with stock `nvcc -cudart shared` runs unmodified: templates, struct-by-val
 `__shared__` halos, `atomicAdd`, managed memory. Its 2D heat-diffusion kernel matches the CPU
 exactly at 34 µs per step.
 
+## From demo to runtime: what a review found
+
+The first public version passed its four end-to-end tests, and a careful review still found five
+real problems. `cuStreamWaitEvent` was a no-op, `cuStreamQuery` blocked, copies did not check that
+they stayed inside their allocation, unified addressing was a heuristic the guest simply trusted,
+and a process killed with GPU work in flight could have its memory recycled under a running kernel.
+None of these show up in a benchmark. All of them show up in production.
+
+**Streams that mean something.** Every CUDA stream is now its own `MTLCommandQueue`. An event
+record signals an `MTLSharedEvent`; `cuStreamWaitEvent` encodes a GPU-side wait on it, so the
+dependency costs no CPU round trip. The legacy default stream waits on, and is waited on by, every
+blocking stream, exactly as CUDA specifies. Queries read the event's counter and never block.
+Then the surprise: on an M3 Max, two independent 15.5 ms kernels on two queues take 31.2 ms
+*natively*. Metal runs compute command buffers from different queues back to back. So streams are
+now correct, not faster, and the test reports overlap as information, not as a pass condition.
+
+**Teardown that survives `kill -9`.** The guest kernel has `CONFIG_MODULES` off, so there is no
+driver to pin pages. The fix lives in user space: arenas are hugetlb `memfd`s, and on first use the
+library double-forks a tiny keeper that holds those file descriptors and a vsock connection
+authenticated with the session id and a nonce. If the client dies, its pages stay allocated until
+the host has drained the GPU and closes the keeper's connection. The crash test kills a process in
+the middle of 300 MiB of in-flight writes and has a second process grab the freed hugepages:
+68 874 corrupted words without the keeper, zero with it.
+
+**Unified addressing as a capability.** The host now verifies the GPU address it predicted and
+advertises UVA in the handshake only when it holds; otherwise the guest library uses translated
+addresses. The whole CUDA suite runs in both modes, with the fallback forced by an environment
+variable on the host.
+
+**A host that assumes a hostile guest.** A fuzzer speaks the wire protocol directly: 400 malformed
+handshakes, 20 000 random submission entries per seed, garbage MSL and PTX, kernels that write
+through wild pointers, and a ring whose tail index is corrupted. It found four ways to crash or hang
+the host process (a misaligned atomic on a guest-chosen event address, two arithmetic overflows in
+dispatch-size checks, and a half-sent handshake that pinned a thread forever) and one guest-side
+hang (a Linux vsock reports a closed peer as readable, not as hang-up). All five are fixed, and the
+fuzzer runs in the test suite.
+
+**Real workloads.** `libcublas.so.12`, compiled against NVIDIA's `cublas_v2.h`, sends SGEMM to
+Apple's `MPSMatrixMultiplication`, running in place on the container's pages. A conjugate-gradient
+Poisson solver with a million unknowns, a FlashAttention-style attention kernel, and kernels
+compiled by **Triton** on a Mac with no NVIDIA GPU all run, each checked against an independent
+reference. Triton's PTX found three parser bugs that nvcc's never triggered, the worst being
+that an instruction following a label and a `.loc` debug directive was silently dropped.
+
 ## Results
 
-All of these run inside the Linux VM:
+`make bench` runs the same Metal kernels at the same sizes in a native macOS process and from inside
+the Linux container, alternating rounds, and reports medians:
 
-| | |
-|---|---|
-| SAXPY over 2 × 256 MiB zero-copy NumPy arrays | 266 GB/s, bit-exact, 24× NumPy |
-| Fused GELU + sin·exp over 64M floats | 145× NumPy |
-| nvcc `tiled_sgemm` 1024³ via the CUDA Driver API | 519–779 GFLOP/s, bit-exact |
-| nvcc `vector_add` | 245–254 GB/s |
-| Tiled MSL matmul 2048³ | 1.70 TFLOP/s, bit-exact |
-| Same SGEMM kernel, Linux guest vs. native host | 1.44 vs 1.47 TFLOP/s (about 98%) |
-| `mpt_alloc` | 25 ns |
-| Container boot + self-test (cached rootfs clone) | 0.65 s |
+| | Native | Linux guest |
+|---|---:|---:|
+| SAXPY, 256 MiB | 270.4 GB/s | 270.7 GB/s |
+| 5-point stencil, 8192² | 251.5 GB/s | 251.5 GB/s |
+| SGEMM (MPS), 4096³ | 8.88 TFLOP/s | 8.92 TFLOP/s |
+| SGEMM (my simdgroup kernel), 4096³ | 1.46 TFLOP/s | 1.47 TFLOP/s |
+| 10 000 tiny dispatches | 1.12 M/s | 1.04 M/s |
+| one tiny dispatch, submit → result visible | 160 µs | 212 µs |
 
-The last comparisons matter most. The passthrough itself is essentially free, and what's left is
-kernel quality. My 4096³ simdgroup SGEMM is not an MLX-class GEMM, and it shows.
+GPU time is identical, because once work reaches the GPU nothing distinguishes guest memory from
+any other Metal buffer. What the VM costs is a fixed ~50–100 µs each time the guest *waits* for a
+result, mostly the host waking from its parked state. Getting the dispatch rate to 94% of native
+took two fixes the benchmark exposed: the host validated each dispatch with an allocation in the
+hot path, and it cut command buffers every 64 dispatches, which throttled on Metal's in-flight
+command-buffer limit. A third finding: passing MPS a multi-matrix descriptor for a single matrix
+quietly selected a GEMM kernel at half speed.
+
+Applications, all inside the VM and each checked against an independent reference: `cublasSgemm`
+from an unmodified nvcc binary at 8.8 TFLOP/s; a CG Poisson solve with a million unknowns at
+0.95 ms per iteration; FlashAttention-style attention at 723 GFLOP/s; NumPy SAXPY at 23× NumPy.
 
 ## Shipping it
 
+- A **runtime plugin** works with the stock, Homebrew-installed `container`: apple/container already
+  loads runtime plugins and has `--runtime`, so `make install-plugin` builds its own Linux runtime
+  helper from the matching release tag with MetalPassthrough compiled in, and
+  `container run --runtime container-runtime-metalpassthrough` does the rest. No CLI change.
 - A **49-line patch** to apple/container adds `container run --gpu`. Internally it reserves
   hugepages on the kernel command line, wraps the VM manager with the MetalPassthrough extension, and
   bind-mounts the guest runtime. It builds under apple/container's `-warnings-as-errors` and works
@@ -241,10 +300,10 @@ There are real limits:
 - **No SASS.** Binaries must carry PTX.
 - **Not translated:** textures, tensor-core instructions, `cp.async`, 64-bit atomics (Metal has
   none), and non-inlined device-function calls.
-- **One queue.** Streams serialize on a single Metal queue.
+- **No stream overlap.** Streams are correct, but Metal on this hardware runs them one after another.
 - **Shared GPU address space.** All processes in one VM share the host process's GPU address space.
-- **Crash window.** A guest process killed while its GPU work is in flight could have its pages
-  recycled before the GPU finishes. An orderly exit always drains the GPU first.
+- **GPU time is not partitioned.** A kernel that never terminates monopolizes the GPU; the session
+  can be killed, the kernel cannot be preempted.
 
 Each of these is engineering rather than research. The research part, zero-copy unified memory
 between a Linux VM and the Apple GPU, turned out to need one new Apple API, a 128-bit nonce, and a

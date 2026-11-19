@@ -55,7 +55,11 @@ final class StreamState {
 public final class MetalComputeDispatcher: @unchecked Sendable {
     public struct Options: Sendable {
         public var spinMicros: UInt64 = 50
-        public var maxBatch: Int = 64
+        /// Dispatches per command buffer while the guest keeps the SQ non-empty. The worker also
+        /// commits whenever the SQ drains, so this only bounds batches under sustained load; each
+        /// command buffer has a fixed cost (queue slot, progress event, completion handler), and
+        /// small batches throttled throughput on the queue's in-flight limit.
+        public var maxBatch: Int = 2048
         public var verbose = false
         public init() {}
     }
@@ -87,6 +91,8 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
     private var streams: [UInt32: StreamState] = [:]
     private var events: [UInt64: (event: MTLSharedEvent, value: UInt64)] = [:]
     private var residencySets: [MTLResidencySet] = []
+    /// Snapshot of the session's arenas for the hot path (refreshed whenever arenas change).
+    private var arenaList: [GuestArena] = []
     private var connectionLost = false
 
     // Updated from command buffer completion handlers (Metal's completion thread).
@@ -114,6 +120,7 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
         sq = arena0.base.advanced(by: Int(MPT_SQ_OFFSET)).assumingMemoryBound(to: mpt_sqe.self)
         cq = arena0.base.advanced(by: Int(MPT_CQ_OFFSET)).assumingMemoryBound(to: mpt_cqe.self)
         if let rs = arena0.residency { residencySets.append(rs) }
+        arenaList = arenas.all
         streams[0] = makeStream(id: 0, blocking: true)
     }
 
@@ -297,7 +304,7 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
         s.submitted += 1
         c.encodeSignalEvent(s.progress, value: s.submitted)
         // Keep the arenas alive until the GPU is done with them (unretained command buffer).
-        let keep = arenas.all
+        let keep = arenaList
         c.addCompletedHandler { [weak self, weak s] done in
             withExtendedLifetime(keep) {}
             guard let self else { return }
@@ -403,6 +410,7 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
                         residencySets.append(rs)
                         for s in streams.values { s.queue.addResidencySet(rs) }
                     }
+                    arenaList = arenas.all
                     log("arena \(a.id): \(a.length >> 20) MiB @ gpu 0x\(String(a.gpuBase, radix: 16)) uva=\(a.unifiedAddressable)")
                     ok(UInt64(a.id), a.gpuBase, a.unifiedAddressable ? MPT_CAP_UVA : 0)
                 } catch { fail(MPT_ENOTFOUND, "\(error)") }
@@ -414,6 +422,7 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
                         residencySets.removeAll { $0 === rs }
                     }
                     _ = arenas.free(id: a.id)
+                    arenaList = arenas.all
                     ok()
                 } else {
                     fail(MPT_ENOENT, "no arena \(e.a.0)")
@@ -601,59 +610,63 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
         p.pointee = s
     }
 
+    /// Hot-path arena lookup over the snapshot (no lock, no allocation): (arena index, byte offset).
+    @inline(__always)
+    private func locate(_ dev: UInt64, _ len: UInt64) -> (Int, Int)? {
+        for i in arenaList.indices where arenaList[i].contains(dev, len) { return (i, Int(dev - arenaList[i].gpuBase)) }
+        return nil
+    }
+
+    /// Validates and encodes one dispatch. Allocation-free: the descriptor is copied (TOCTOU) into a
+    /// stack buffer, bindings are validated in a first pass and encoded in a second.
     private func dispatch(_ e: mpt_sqe, on s: StreamState) throws {
         guard let ps = handles[e.a.0] else { throw OpError.invalid("unknown pipeline \(e.a.0)") }
         let len = e.a.2
         let header = UInt64(MemoryLayout<mpt_dispatch_desc>.size)
         guard len >= header, len <= UInt64(MPT_SCRATCH_PER_SLOT) else { throw ArenaError.outOfRange(e.a.1, len) }
-        let raw = try arenas.pointer(e.a.1, len)
-        // Copy the descriptor before validating it: the guest may keep writing to it (TOCTOU).
-        let desc = [UInt8](UnsafeRawBufferPointer(start: raw, count: Int(len)))
-        try desc.withUnsafeBytes { db in
-            let base = db.baseAddress!
+        guard let (di, doff) = locate(e.a.1, len) else { throw ArenaError.outOfRange(e.a.1, len) }
+        let raw = arenaList[di].base.advanced(by: doff)
+        try withUnsafeTemporaryAllocation(byteCount: Int(len), alignment: 16) { tmp in
+            tmp.copyMemory(from: UnsafeRawBufferPointer(start: raw, count: Int(len)))
+            let base = tmp.baseAddress!
             let d = base.loadUnaligned(as: mpt_dispatch_desc.self)
+            let nb = Int(d.nbindings)
             guard d.nbindings <= Self.maxBindings, header + UInt64(d.nbindings) * 24 <= len else {
                 throw OpError.invalid("\(d.nbindings) bindings do not fit a \(len)-byte descriptor")
             }
             guard d.mode == MPT_DISPATCH_THREADS || d.mode == MPT_DISPATCH_THREADGROUPS else {
                 throw OpError.invalid("dispatch mode \(d.mode)")
             }
-            let tgs = [Int(max(d.tg.0, 1)), Int(max(d.tg.1, 1)), Int(max(d.tg.2, 1))]
-            let grid = [Int(max(d.grid.0, 1)), Int(max(d.grid.1, 1)), Int(max(d.grid.2, 1))]
+            let t0 = Int(max(d.tg.0, 1)), t1 = Int(max(d.tg.1, 1)), t2 = Int(max(d.tg.2, 1))
+            let g0 = UInt64(max(d.grid.0, 1)), g1 = UInt64(max(d.grid.1, 1)), g2 = UInt64(max(d.grid.2, 1))
             // Per-dimension limits first: only then is the threadgroup product small enough to compute.
             let maxTG = device.maxThreadsPerThreadgroup
-            guard tgs[0] <= maxTG.width, tgs[1] <= maxTG.height, tgs[2] <= maxTG.depth,
-                tgs[0] * tgs[1] * tgs[2] <= ps.maxTotalThreadsPerThreadgroup
-            else { throw OpError.invalid("threadgroup \(tgs) exceeds pipeline limit \(ps.maxTotalThreadsPerThreadgroup)") }
-            // Overflow-safe: guest-controlled grid factors can exceed 2^64 when multiplied.
-            var total: UInt64 = 1
-            var overflow = false
-            for f in grid + (d.mode == MPT_DISPATCH_THREADS ? [] : [tgs[0] * tgs[1] * tgs[2]]) {
-                let (v, o) = total.multipliedReportingOverflow(by: UInt64(f))
-                total = v
-                overflow = overflow || o
+            guard t0 <= maxTG.width, t1 <= maxTG.height, t2 <= maxTG.depth, t0 * t1 * t2 <= ps.maxTotalThreadsPerThreadgroup else {
+                throw OpError.invalid("threadgroup \(t0)x\(t1)x\(t2) exceeds pipeline limit \(ps.maxTotalThreadsPerThreadgroup)")
             }
-            guard !overflow, total <= Self.maxThreadsPerDispatch else { throw OpError.invalid("dispatch geometry \(grid) x \(tgs) too large") }
+            // Overflow-safe total thread count (guest-controlled factors can exceed 2^64).
+            let (p01, o1) = g0.multipliedReportingOverflow(by: g1)
+            let (p012, o2) = p01.multipliedReportingOverflow(by: g2)
+            let (total, o3) = p012.multipliedReportingOverflow(by: d.mode == MPT_DISPATCH_THREADS ? 1 : UInt64(t0 * t1 * t2))
+            guard !o1, !o2, !o3, total <= Self.maxThreadsPerDispatch else {
+                throw OpError.invalid("dispatch geometry \(g0)x\(g1)x\(g2) x \(t0)x\(t1)x\(t2) too large")
+            }
+            @inline(__always) func binding(_ i: Int) -> mpt_binding {
+                base.advanced(by: Int(header) + i * 24).loadUnaligned(as: mpt_binding.self)
+            }
+            // Pass 1: validate everything before encoding anything.
             var tgMemTotal = ps.staticThreadgroupMemoryLength
-            // Validate every binding before encoding anything.
-            var plan: [(kind: UInt32, index: Int, arena: GuestArena?, off: Int, len: Int)] = []
-            for i in 0..<Int(d.nbindings) {
-                let b = base.advanced(by: Int(header) + i * 24).loadUnaligned(as: mpt_binding.self)
+            for i in 0..<nb {
+                let b = binding(i)
                 guard b.index <= Self.maxBindIndex else { throw OpError.invalid("binding index \(b.index)") }
                 switch b.kind {
                 case MPT_BIND_BUFFER:
-                    let (a, off) = try arenas.resolve(b.addr, b.len)
-                    plan.append((b.kind, Int(b.index), a, off, Int(b.len)))
+                    guard locate(b.addr, b.len) != nil else { throw ArenaError.outOfRange(b.addr, b.len) }
                 case MPT_BIND_BYTES:
-                    guard b.len > 0, b.addr <= len, b.len <= len - b.addr, b.len <= 4096 else {
-                        throw ArenaError.outOfRange(b.addr, b.len)
-                    }
-                    plan.append((b.kind, Int(b.index), nil, Int(b.addr), Int(b.len)))
+                    guard b.len > 0, b.addr <= len, b.len <= len - b.addr, b.len <= 4096 else { throw ArenaError.outOfRange(b.addr, b.len) }
                 case MPT_BIND_TGMEM:
                     guard b.len <= UInt64(device.maxThreadgroupMemoryLength) else { throw OpError.invalid("threadgroup memory \(b.len)") }
-                    let l = (Int(b.len) + 15) & ~15
-                    tgMemTotal += l
-                    plan.append((b.kind, Int(b.index), nil, 0, l))
+                    tgMemTotal += (Int(b.len) + 15) & ~15
                 default:
                     throw OpError.invalid("binding kind \(b.kind)")
                 }
@@ -661,22 +674,28 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
             guard tgMemTotal <= device.maxThreadgroupMemoryLength else {
                 throw OpError.invalid("threadgroup memory \(tgMemTotal) > \(device.maxThreadgroupMemoryLength)")
             }
+            // Pass 2: encode (cannot fail: the descriptor copy and the arena snapshot are unchanged).
             let enc = compute(s)
             enc.setComputePipelineState(ps)
-            for p in plan {
-                switch p.kind {
-                case MPT_BIND_BUFFER: enc.setBuffer(p.arena!.buffer, offset: p.arena!.bufferOffset + p.off, index: p.index)
-                case MPT_BIND_BYTES: enc.setBytes(base.advanced(by: p.off), length: p.len, index: p.index)
-                default: if p.len > 0 { enc.setThreadgroupMemoryLength(p.len, index: p.index) }
+            for i in 0..<nb {
+                let b = binding(i)
+                switch b.kind {
+                case MPT_BIND_BUFFER:
+                    let (ai, off) = locate(b.addr, b.len)!
+                    enc.setBuffer(arenaList[ai].buffer, offset: arenaList[ai].bufferOffset + off, index: Int(b.index))
+                case MPT_BIND_BYTES:
+                    enc.setBytes(base.advanced(by: Int(b.addr)), length: Int(b.len), index: Int(b.index))
+                default:
+                    if b.len > 0 { enc.setThreadgroupMemoryLength((Int(b.len) + 15) & ~15, index: Int(b.index)) }
                 }
             }
             if d.use_all_arenas != 0 {
-                for a in arenas.all { enc.useResource(a.buffer, usage: [.read, .write]) }
+                for a in arenaList { enc.useResource(a.buffer, usage: [.read, .write]) }
             }
-            let g = MTLSize(width: grid[0], height: grid[1], depth: grid[2])
-            let t = MTLSize(width: tgs[0], height: tgs[1], depth: tgs[2])
-            if d.mode == MPT_DISPATCH_THREADS { enc.dispatchThreads(g, threadsPerThreadgroup: t) } else {
-                enc.dispatchThreadgroups(g, threadsPerThreadgroup: t)
+            let tgSize = MTLSize(width: t0, height: t1, depth: t2)
+            let grid = MTLSize(width: Int(g0), height: Int(g1), depth: Int(g2))
+            if d.mode == MPT_DISPATCH_THREADS { enc.dispatchThreads(grid, threadsPerThreadgroup: tgSize) } else {
+                enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tgSize)
             }
         }
         s.batched += 1
@@ -713,8 +732,12 @@ public final class MetalComputeDispatcher: @unchecked Sendable {
             device: device, transposeLeft: g.trans_b == 1, transposeRight: g.trans_a == 1,
             resultRows: n, resultColumns: m, interiorColumns: k, alpha: Double(g.alpha), beta: Double(g.beta))
         func desc(_ v: (rows: Int, cols: Int, ld: Int), _ stride: UInt64) -> MPSMatrixDescriptor {
-            MPSMatrixDescriptor(rows: v.rows, columns: v.cols, matrices: Int(g.batch), rowBytes: v.ld * 4,
-                                matrixBytes: Int(stride) * 4, dataType: .float32)
+            // Single matrices use the plain descriptor: the multi-matrix form (even with matrices = 1)
+            // made MPS pick a markedly slower kernel (measured 47-62% of native).
+            g.batch == 1
+                ? MPSMatrixDescriptor(rows: v.rows, columns: v.cols, rowBytes: v.ld * 4, dataType: .float32)
+                : MPSMatrixDescriptor(rows: v.rows, columns: v.cols, matrices: Int(g.batch), rowBytes: v.ld * 4,
+                                      matrixBytes: Int(stride) * 4, dataType: .float32)
         }
         // MPS encodes its own passes, which our per-stream fence cannot order (fences order the encoders
         // that wait on them, and the arena buffers are untracked). A command-buffer boundary does:

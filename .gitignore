@@ -27,3 +27,4 @@ e2e/robustness/fuzz
 e2e/apps/cublas_gemm
 e2e/apps/cg_solver
 e2e/apps/attention
+bench/bench_guest
