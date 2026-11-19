@@ -5,61 +5,6 @@ import Darwin
 import Foundation
 import Metal
 
-/// Tracks live sessions in this VM and MetalPassthrough-enabled VMs on this host
-/// (one marker file per VM under /tmp/metalpassthrough/vms, pruned by pid liveness).
-public final class SessionRegistry: @unchecked Sendable {
-    public static let root = URL(fileURLWithPath: "/tmp/metalpassthrough")
-    private let lock = NSLock()
-    private var sessions = 0
-    private let marker: URL
-
-    public init(containerID: String) {
-        let dir = Self.root.appendingPathComponent("vms", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        marker = dir.appendingPathComponent("\(getpid())-\(containerID)")
-        FileManager.default.createFile(atPath: marker.path, contents: Data(containerID.utf8))
-    }
-
-    deinit { try? FileManager.default.removeItem(at: marker) }
-
-    public func remove() { try? FileManager.default.removeItem(at: marker) }
-
-    public struct SessionInfo: Sendable {
-        public let session: UInt32
-        public let pid: UInt32
-        public let comm: String
-        public var arenaBytes: UInt64 = 0
-        public var dispatches: UInt64 = 0
-        public var gpuNs: UInt64 = 0
-    }
-    private var infos: [UInt32: SessionInfo] = [:]
-    private var lastKernelNs: UInt64 = 0
-
-    func opened(_ info: SessionInfo) { lock.withLock { sessions += 1; infos[info.session] = info } }
-    func closed(_ sid: UInt32) { lock.withLock { sessions -= 1; infos.removeValue(forKey: sid) } }
-    func update(_ sid: UInt32, arena: UInt64, dispatches: UInt64, gpuNs: UInt64, lastKernel: UInt64?) {
-        lock.withLock {
-            infos[sid]?.arenaBytes = arena
-            infos[sid]?.dispatches = dispatches
-            infos[sid]?.gpuNs = gpuNs
-            if let k = lastKernel, k > 0 { lastKernelNs = k }
-        }
-    }
-    var sessionsInThisVM: UInt32 { lock.withLock { UInt32(sessions) } }
-    var snapshot: (procs: [SessionInfo], lastKernel: UInt64) { lock.withLock { (infos.values.sorted { $0.session < $1.session }, lastKernelNs) } }
-
-    func activeContainers() -> UInt32 {
-        let dir = Self.root.appendingPathComponent("vms")
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-        var n: UInt32 = 0
-        for name in names {
-            guard let pid = Int32(name.split(separator: "-").first ?? "") else { continue }
-            if kill(pid, 0) == 0 || errno == EPERM { n += 1 } else { try? FileManager.default.removeItem(at: dir.appendingPathComponent(name)) }
-        }
-        return n
-    }
-}
-
 /// Per-VM MetalPassthrough host endpoint. Accepts guest connections (vsock port 2049 via the VZ
 /// extension) and runs one MetalComputeDispatcher per connection.
 @available(macOS 27.0, *)
@@ -147,6 +92,15 @@ public final class MetalPassthroughServer: @unchecked Sendable {
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
     }
 
+    /// How sessions are isolated from each other on the GPU (host environment
+    /// METALPASSTHROUGH_ISOLATION): `process` (default) runs every guest process's session in its own
+    /// GPU worker process, hence its own GPU address space, so a shader's forged pointers cannot
+    /// reach other sessions; `shared` runs all sessions of the VM in this process (one GPU address
+    /// space per VM: faster session start, no intra-VM isolation).
+    public enum Isolation: String, Sendable { case process, shared }
+    public var isolation: Isolation =
+        Isolation(rawValue: ProcessInfo.processInfo.environment["METALPASSTHROUGH_ISOLATION"] ?? "") ?? .process
+
     func serve(_ s: FDStream) throws {
         Self.setReadTimeout(s.fd, seconds: 5)
         var magic: UInt32 = 0
@@ -155,67 +109,175 @@ public final class MetalPassthroughServer: @unchecked Sendable {
         var hello = mpt_hello()
         hello.magic = magic
         try withUnsafeMutableBytes(of: &hello) { try s.readExact($0.baseAddress!.advanced(by: 4), $0.count - 4) }
-        func reply(_ status: Int32, _ base: UInt64 = 0, _ sid: UInt32 = 0, _ caps: UInt64 = 0) throws {
-            var ack = mpt_hello_ack(magic: MPT_MAGIC, status: status, gpu_base: base, session_id: sid, arena_id: 0, caps: caps)
-            try withUnsafeBytes(of: &ack) { try s.writeAll($0.baseAddress!, $0.count) }
-        }
         guard hello.magic == MPT_MAGIC, hello.version == MPT_ABI_VERSION else {
-            try reply(MPT_EPROTO)
+            try SessionRunner.reply(s, MPT_EPROTO)
+            return
+        }
+        guard hello.nchunks >= 1, UInt64(hello.nchunks) <= max(1, guestMemoryBytes / UInt64(MPT_CHUNK_SIZE)) else {
+            try SessionRunner.reply(s, MPT_EINVAL)
             return
         }
         let nonce = withUnsafeBytes(of: hello.nonce) { Array($0) }
         let comm = withUnsafeBytes(of: hello.comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
-        let arenas = MetalArenaAllocator(device: device, memory: memory, guestMemoryBytes: guestMemoryBytes)
-        guard hello.nchunks >= 1, UInt64(hello.nchunks) <= arenas.maxChunks else {
-            try reply(MPT_EINVAL)
-            return
-        }
-        let t0 = DispatchTime.now().uptimeNanoseconds
-        let arena0: GuestArena
-        do { arena0 = try arenas.map(nonce: nonce, count: Int(hello.nchunks)) } catch {
-            log("HELLO from pid \(hello.pid) (\(comm)): \(error)")
-            try reply(MPT_ENOTFOUND)
-            return
-        }
-        guard arena0.length >= Int(MPT_HEAP_OFFSET) else {
-            try reply(MPT_EINVAL)
-            return
-        }
-        // The host owns initialization of the control region (it overlaps the chunk-0 stamp).
-        memset(arena0.base, 0, Int(MPT_CONTROL_SIZE))
-        let ring = arena0.base.assumingMemoryBound(to: mpt_ring_header.self)
-        ring.pointee.version = MPT_ABI_VERSION
-        ring.pointee.sq_depth = MPT_SQ_DEPTH
-        ring.pointee.cq_depth = MPT_CQ_DEPTH
-        ring.pointee.arena_bytes = UInt64(arena0.length)
-        mpt_fence_seqcst()
-        ring.pointee.magic = MPT_MAGIC
-        info.write(to: arena0.base.advanced(by: Int(MPT_INFO_OFFSET)))
         let sid = lock.withLock { () -> UInt32 in
             defer { nextSession += 1 }
             return nextSession
         }
-        log(String(format: "session %u: pid %u (%@) arena0 %d MiB mapped zero-copy in %.2f ms, gpu base 0x%llx",
-                   sid, hello.pid, comm, arena0.length >> 20, Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6, arena0.gpuBase))
-        let disp = MetalComputeDispatcher(
-            sessionID: sid, device: device, arenas: arenas, arena0: arena0, pipelines: pipelines, info: info, stream: s,
-            registry: registry, options: options)
-        registry.opened(.init(session: sid, pid: hello.pid, comm: comm, arenaBytes: UInt64(arena0.length)))
-        defer { registry.closed(sid) }
+        // The keeper may connect as soon as the guest sees the ack: register it first.
         let link = KeeperLink(nonce: nonce)
         lock.withLock { keepers[sid] = link }
-        try reply(0, arena0.gpuBase, sid, MPT_CAP_STREAMS | MPT_CAP_KEEPER | (arena0.unifiedAddressable ? MPT_CAP_UVA : 0))
-        Self.setReadTimeout(s.fd, seconds: 0)  // established: the doorbell may legitimately stay idle
-        disp.run()  // returns only after all GPU work drained and the arenas were unmapped
-        let fd = lock.withLock { () -> Int32 in
-            link.ended = true
-            keepers.removeValue(forKey: sid)
-            defer { link.fd = -1 }
-            return link.fd
+        registry.opened(.init(session: sid, pid: hello.pid, comm: comm))
+        defer {
+            registry.closed(sid)
+            let fd = lock.withLock { () -> Int32 in
+                link.ended = true
+                keepers.removeValue(forKey: sid)
+                defer { link.fd = -1 }
+                return link.fd
+            }
+            if fd >= 0 {
+                Self.release(fd)
+                log("session \(sid): GPU drained, keeper released (guest may now reuse the hugepages)")
+            }
         }
-        if fd >= 0 {
-            Self.release(fd)
-            log("session \(sid): GPU drained, keeper released (guest may now reuse the hugepages)")
+        switch isolation {
+        case .shared:
+            try SessionRunner.run(
+                stream: s, hello: hello, sid: sid, device: device, memory: memory, guestMemoryBytes: guestMemoryBytes,
+                pipelines: pipelines, info: info, registry: registry, options: options, caps: 0)
+        case .process:
+            // Returns when the worker exited: its GPU work has drained (or died with the process,
+            // which tears down its GPU context), so the keeper can release the pages.
+            try runWorker(sessionFD: s.fd, sid: sid, hello: hello)
+        }
+    }
+
+    // MARK: - Per-session GPU worker processes
+
+    /// Mach memory entries shared into every worker: guest RAM and the session table.
+    private var sharedPorts: (ram: mach_port_t, table: mach_port_t, ramBase: UInt64, ramLength: Int)?
+    private static let spawnLock = NSLock()  // mach_ports_register is per task
+
+    private static func memoryEntry(_ addr: UnsafeMutableRawPointer, _ length: Int) throws -> mach_port_t {
+        var size = memory_object_size_t(length)
+        var port: mach_port_t = 0
+        let MAP_MEM_VM_SHARE: vm_prot_t = 0x400000  // share the existing mapping's pages (no copy)
+        let kr = mach_make_memory_entry_64(
+            mach_task_self_, &size, memory_object_offset_t(UInt(bitPattern: addr)), VM_PROT_READ | VM_PROT_WRITE | MAP_MEM_VM_SHARE, &port, 0)
+        guard kr == KERN_SUCCESS, size >= memory_object_size_t(length) else { throw GuestMemoryError.machError("mach_make_memory_entry_64", kr) }
+        return port
+    }
+
+    private func ports() throws -> (ram: mach_port_t, table: mach_port_t, ramBase: UInt64, ramLength: Int) {
+        try lock.withLock {
+            if let p = sharedPorts { return p }
+            let ram = try memory.guestRAMView(expectedSize: guestMemoryBytes)
+            let p = (try Self.memoryEntry(ram.bytes, ram.length), try Self.memoryEntry(registry.table, SessionRegistry.tableBytes), ram.base, ram.length)
+            sharedPorts = p
+            return p
+        }
+    }
+
+    /// mpt-gpu-worker lookup: $METALPASSTHROUGH_WORKER, next to this executable (mpt-run, the runtime
+    /// plugin's bin/), or <exe>/../share/metalpassthrough.
+    public static func findWorker() -> String? {
+        var candidates: [String] = []
+        if let e = ProcessInfo.processInfo.environment["METALPASSTHROUGH_WORKER"] { candidates.append(e) }
+        let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
+        candidates += [exe.appendingPathComponent("mpt-gpu-worker").path, exe.appendingPathComponent("../share/metalpassthrough/mpt-gpu-worker").path]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// Spawns `mpt-gpu-worker` with `fd3` as its fd 3 and the shared memory entries registered.
+    private func spawnWorker(_ extra: [String], fd3: Int32) throws -> pid_t {
+        guard let worker = Self.findWorker() else {
+            throw CompileError.pipeline("mpt-gpu-worker not found (set METALPASSTHROUGH_WORKER, or METALPASSTHROUGH_ISOLATION=shared)")
+        }
+        let p = try ports()
+        var args = [worker, "--ram-base", "\(p.ramBase)", "--ram-length", "\(p.ramLength)", "--guest-memory", "\(guestMemoryBytes)"] + extra
+        if options.verbose { args.append("--verbose") }
+        // Probed (including the bandwidth measurement) once by this process, not per session.
+        if let json = try? JSONEncoder().encode(info) { args += ["--device-info", json.base64EncodedString()] }
+
+        var fa: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&fa)
+        defer { posix_spawn_file_actions_destroy(&fa) }
+        posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_addinherit_np(&fa, 1)
+        posix_spawn_file_actions_addinherit_np(&fa, 2)
+        if fd3 == 3 { posix_spawn_file_actions_addinherit_np(&fa, 3) } else { posix_spawn_file_actions_adddup2(&fa, fd3, 3) }
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        // Only fds 0-3 reach the worker: never another session's socket.
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT))
+        let cargs = args.map { strdup($0) } + [nil]
+        defer { cargs.forEach { free($0) } }
+        var pid: pid_t = 0
+        let rc: Int32 = Self.spawnLock.withLock {
+            // Registered ports are copied into a task when it is created: hand the worker the guest
+            // RAM and session-table entries, and clear them again so nothing else inherits them.
+            var regs = [p.ram, p.table]
+            _ = regs.withUnsafeMutableBufferPointer { mach_ports_register(mach_task_self_, $0.baseAddress, 2) }
+            defer { _ = mach_ports_register(mach_task_self_, nil, 0) }
+            return posix_spawn(&pid, worker, &fa, &attr, cargs, environ)
+        }
+        guard rc == 0 else { throw CompileError.pipeline("spawning \(worker) failed: \(String(cString: strerror(rc)))") }
+        return pid
+    }
+
+    /// One pre-started worker (Metal device and caches initialized, guest RAM mapped) so a session
+    /// does not wait for process start-up and MTLDevice creation (~50 ms).
+    private var spare: (pid: pid_t, control: Int32)?
+    private var spawningSpare = false
+
+    private func refillSpare() {
+        let go: Bool = lock.withLock {
+            guard spare == nil, !spawningSpare else { return false }
+            spawningSpare = true
+            return true
+        }
+        guard go else { return }
+        DispatchQueue.global(qos: .utility).async { [self] in
+            var sv: [Int32] = [-1, -1]
+            var result: (pid_t, Int32)?
+            if socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) == 0 {
+                if let pid = try? spawnWorker(["--spare"], fd3: sv[1]) { result = (pid, sv[0]) } else { Darwin.close(sv[0]) }
+                Darwin.close(sv[1])
+            }
+            lock.withLock {
+                spawningSpare = false
+                if let result { spare = (result.0, result.1) }
+            }
+        }
+    }
+
+    private func runWorker(sessionFD: Int32, sid: UInt32, hello: mpt_hello) throws {
+        var pid: pid_t = -1
+        if let sp = lock.withLock({ () -> (pid: pid_t, control: Int32)? in defer { spare = nil }; return spare }) {
+            var msg = WorkerAssignment(sid: sid, reserved: 0, hello: hello)
+            let sent = withUnsafeBytes(of: &msg) { mpt_send_fd(sp.control, sessionFD, $0.baseAddress, $0.count) } == 0
+            Darwin.close(sp.control)  // the spare exits if it never got a session
+            if sent { pid = sp.pid } else { kill(sp.pid, SIGKILL); var st: Int32 = 0; waitpid(sp.pid, &st, 0) }
+        }
+        if pid < 0 {
+            var h = hello
+            let helloHex = withUnsafeBytes(of: &h) { $0.map { String(format: "%02x", $0) }.joined() }
+            do { pid = try spawnWorker(["--sid", "\(sid)", "--hello", helloHex], fd3: sessionFD) } catch {
+                log("session \(sid): \(error)")
+                try SessionRunner.reply(FDStream(fd: sessionFD), MPT_EPROTO)
+                return
+            }
+        }
+        refillSpare()
+        log("session \(sid): GPU worker pid \(pid)")
+        var status: Int32 = 0
+        while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+        let signaled = status & 0x7f
+        if signaled != 0 && signaled != 0x7f {
+            log("session \(sid): GPU worker \(pid) killed by signal \(signaled)")
+        } else if (status >> 8) & 0xff != 0 {
+            log("session \(sid): GPU worker \(pid) exited with status \((status >> 8) & 0xff)")
         }
     }
 }

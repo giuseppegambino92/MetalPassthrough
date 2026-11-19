@@ -236,6 +236,19 @@ then a probe waits for the entire hugepage pool and checks every word of it. Wit
 zero foreign words and zero leaked pages. With the keeper disabled: 16–19 million corrupted words
 per round.
 
+**One GPU address space per guest process.** A shader is arbitrary code that can build any
+pointer, and Apple GPUs do not bounds-check device pointers. A probe kernel showed what that meant
+in the first design: from one process in a container, it read *and wrote* another process's tensors,
+because all sessions of a VM lived in one host process and so in one GPU address space. Another VM
+was unreachable, since it is another process. The fix uses that same boundary. Every guest process
+now gets its own host worker process. The VM owner shares guest RAM into it as a Mach memory entry
+(handed over with `mach_ports_register`, which a child task inherits at creation), and passes the
+session socket and nothing else. The worker wraps only that session's arenas as Metal buffers, so
+the same probe now reads zeros and the victim sees no modified words. A side effect is fault
+containment: a Metal Performance Shaders assertion or a driver error now kills one session, not the
+container's GPU service. The cost is about 50 ms of `MTLCreateSystemDefaultDevice` per process,
+hidden by keeping one worker pre-started.
+
 **Unified addressing as a capability.** The host now verifies the GPU address it predicted and
 advertises UVA in the handshake only when it holds; otherwise the guest library uses translated
 addresses. The whole CUDA suite runs in both modes, with the fallback forced by an environment
@@ -314,9 +327,7 @@ There are real limits:
 - **No SASS.** Binaries must carry PTX.
 - **Not translated:** textures, tensor-core instructions, `cp.async`, 64-bit atomics (Metal has
   none), and non-inlined device-function calls.
-- **The VM is the isolation boundary.** A shader can build any pointer. It cannot reach another
-  VM (each VM's GPU work lives in its own host process and GPU address space, which a test asserts),
-  but it can read and write the GPU memory of other processes *in the same container*.
+
 - **GPU time is not partitioned.** A kernel that never terminates monopolizes the GPU; the session
   can be killed, the kernel cannot be preempted.
 

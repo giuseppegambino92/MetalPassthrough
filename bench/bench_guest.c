@@ -67,20 +67,23 @@ int main(int argc, char **argv) {
     src[fread(src, 1, sizeof src - 1, f)] = 0;
     fclose(f);
 
-    /* ---- session / memory costs (fresh sessions of growing arena size) ---- */
-    for (size_t mib = 64; mib <= 1024; mib *= 4) {
-        double wv[5];
-        for (int i = 0; i < 5; i++) {
-            mpt_ctx *t;
-            double t0 = now();
-            if (mpt_open(&t, mib << 20)) { fprintf(stderr, "open %zu MiB: %s\n", mib, mpt_last_error()); return 1; }
-            wv[i] = now() - t0;
-            mpt_close(t);
+    /* ---- session / memory costs (fresh sessions of growing arena size). "spaced" leaves 150 ms
+     * between sessions, like successive processes starting; "back-to-back" reopens immediately. ---- */
+    for (int spaced = 1; spaced >= 0; spaced--)
+        for (size_t mib = 64; mib <= 1024; mib *= 4) {
+            double wv[5];
+            for (int i = 0; i < 5; i++) {
+                mpt_ctx *t;
+                if (spaced) usleep(150000);
+                double t0 = now();
+                if (mpt_open(&t, mib << 20)) { fprintf(stderr, "open %zu MiB: %s\n", mib, mpt_last_error()); return 1; }
+                wv[i] = now() - t0;
+                mpt_close(t);
+            }
+            char sz[48];
+            snprintf(sz, sizeof sz, "%zuMiB%s", mib, spaced ? "" : "-back-to-back");
+            row("session_open", sz, 0, median(wv, 5), median(wv, 5) * 1e3, "ms");
         }
-        char sz[32];
-        snprintf(sz, sizeof sz, "%zuMiB", mib);
-        row("session_open", sz, 0, median(wv, 5), median(wv, 5) * 1e3, "ms");
-    }
 
     if (mpt_open(&c, 1100u << 20)) { fprintf(stderr, "%s\n", mpt_last_error()); return 1; }
     char log[8192];

@@ -88,7 +88,16 @@ public final class PipelineCache: @unchecked Sendable {
         }
         lock.withLock { memory[key] = ps; compiles += 1 }
         if archived, let archive {
-            lock.withLock { try? archive.serialize(to: archiveURL) }
+            // Several processes (one GPU worker per guest process) share this file: write a private
+            // temporary and rename it into place atomically, so readers never see a torn archive.
+            // Concurrent writers may drop each other's additions; that only costs a recompile.
+            lock.withLock {
+                let tmp = archiveURL.deletingLastPathComponent()
+                    .appendingPathComponent(".\(archiveURL.lastPathComponent).\(getpid()).\(UInt64.random(in: 0...UInt64.max)).tmp")
+                if (try? archive.serialize(to: tmp)) != nil {
+                    if rename(tmp.path, archiveURL.path) != 0 { try? FileManager.default.removeItem(at: tmp) }
+                }
+            }
         }
         return CompiledPipeline(state: ps, cacheHit: false)
     }

@@ -59,13 +59,13 @@ public enum ArenaError: Error, CustomStringConvertible {
 public final class MetalArenaAllocator: @unchecked Sendable {
     static let creationLock = NSLock()
     public let device: MTLDevice
-    public let memory: GuestMemoryDevice
+    public let memory: any GuestRAMProvider
     public let guestMemoryBytes: UInt64
     private var arenas: [UInt32: GuestArena] = [:]
     private var nextID: UInt32 = 0
     private let lock = NSLock()
 
-    public init(device: MTLDevice, memory: GuestMemoryDevice, guestMemoryBytes: UInt64) {
+    public init(device: MTLDevice, memory: any GuestRAMProvider, guestMemoryBytes: UInt64) {
         self.device = device
         self.memory = memory
         self.guestMemoryBytes = guestMemoryBytes
@@ -82,14 +82,14 @@ public final class MetalArenaAllocator: @unchecked Sendable {
     public func map(nonce: [UInt8], count: Int) throws -> GuestArena {
         guard nonce.count == 16, count >= 1, UInt64(count) <= maxChunks else { throw ArenaError.chunksNotFound(found: 0, expected: count) }
         guard nonce.contains(where: { $0 != 0 }) else { throw ArenaError.chunksNotFound(found: 0, expected: count) }
-        let ram = try memory.guestRAM(expectedSize: guestMemoryBytes)
+        let ram = try memory.guestRAMView(expectedSize: guestMemoryBytes)
         let chunk = Int(MPT_CHUNK_SIZE)
         var found = [UnsafeMutableRawPointer?](repeating: nil, count: count)
         var nfound = 0
-        let base = ram.mapping.mutableBytes
+        let base = ram.bytes
         nonce.withUnsafeBytes { n in
             var off = 0
-            while off + chunk <= ram.mapping.length {
+            while off + chunk <= ram.length {
                 let p = base.advanced(by: off)
                 if memcmp(p, n.baseAddress!, 16) == 0 {
                     let stamp = p.assumingMemoryBound(to: mpt_chunk_stamp.self).pointee

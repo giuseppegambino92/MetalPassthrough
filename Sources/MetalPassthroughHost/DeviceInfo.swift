@@ -8,7 +8,7 @@ import Metal
 public let containerGPUVersion = "0.1.0"
 
 /// Host GPU facts published to every guest session (mpt_device_info).
-public struct HostGPUInfo: Sendable {
+public struct HostGPUInfo: Sendable, Codable {
     public let name: String
     public let gpuCores: UInt32
     public let metalFamily: String

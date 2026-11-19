@@ -74,6 +74,7 @@ extern "C" {
     fn mpt_get_stats(ctx: *mut c_void, out: *mut Stats) -> c_int;
     fn mpt_ping(ctx: *mut c_void, rt_ns: *mut u64) -> c_int;
     fn mpt_unified_addressing(ctx: *mut c_void) -> c_int;
+    fn mpt_session_caps(ctx: *mut c_void) -> u64;
     fn mpt_session_id(ctx: *mut c_void) -> u32;
     fn mpt_close(ctx: *mut c_void);
 }
@@ -128,6 +129,7 @@ struct Sample {
     info: DeviceInfo,
     stats: Stats,
     uva: bool,
+    isolated: bool,
     session: u32,
     lat_min: u64,
     lat_med: u64,
@@ -154,6 +156,7 @@ fn sample(ctx: *mut c_void) -> Result<Sample, String> {
         info: unsafe { *mpt_device(ctx) },
         stats,
         uva: unsafe { mpt_unified_addressing(ctx) } != 0,
+        isolated: unsafe { mpt_session_caps(ctx) } & 0x8 != 0, // MPT_CAP_PROCESS_ISOLATION
         session: unsafe { mpt_session_id(ctx) },
         lat_min: lat[0],
         lat_med: lat[lat.len() / 2],
@@ -237,7 +240,12 @@ fn render(s: &Sample) -> String {
     o.push(format!("+{}+", "-".repeat(W)));
     o.push(String::new());
     o.push(format!("+{}+", "-".repeat(W)));
-    o.push(row(&[("Processes:", W)]));
+    let iso = if s.isolated {
+        "GPU isolation: per process (own GPU address space)"
+    } else {
+        "GPU isolation: shared by all processes in this VM"
+    };
+    o.push(row(&[(&format!("Processes:{:>width$}", iso, width = W - 12), W)]));
     o.push(row(&[("  Session     PID  Process name          Arena MiB    Dispatches        GPU time", W)]));
     o.push(format!("|{}|", "=".repeat(W)));
     let n = (st.nprocs as usize).min(MAX_PROCS);
@@ -282,7 +290,7 @@ fn json(s: &Sample) -> String {
         .collect();
     format!(
         "{{\"name\":\"{}\",\"gpu_cores\":{},\"metal_family\":\"{}\",\"host_os\":\"{}\",\"unified_memory_bytes\":{},\
-\"recommended_working_set\":{},\"measured_bandwidth_gbs\":{:.1},\"uva\":{},\"arena_bytes_vm\":{},\"hugepages_total\":{},\
+\"recommended_working_set\":{},\"measured_bandwidth_gbs\":{:.1},\"uva\":{},\"process_isolation\":{},\"arena_bytes_vm\":{},\"hugepages_total\":{},\
 \"hugepages_free\":{},\"active_containers\":{},\"sessions_vm\":{},\"pipeline_compiles\":{},\"pipeline_cache_hits\":{},\
 \"last_kernel_gpu_ns\":{},\"ring_latency_ns\":{{\"min\":{},\"median\":{},\"p99\":{}}},\"processes\":[{}]}}",
         cstr(&i.name),
@@ -293,6 +301,7 @@ fn json(s: &Sample) -> String {
         i.recommended_working_set,
         i.measured_bandwidth_gbs,
         s.uva,
+        s.isolated,
         st.vm_arena_bytes,
         s.hp_total,
         s.hp_free,

@@ -29,6 +29,19 @@ public enum GuestMemoryError: Error, CustomStringConvertible {
     }
 }
 
+/// A host view of guest DRAM: guest-physical `base`, mapped at `bytes` for `length` bytes.
+public struct GuestRAMView: @unchecked Sendable {
+    public let base: UInt64
+    public let bytes: UnsafeMutableRawPointer
+    public let length: Int
+}
+
+/// Where the arena allocator finds guest RAM: the VZ device in the VM-owning process, or a Mach
+/// memory entry shared into a per-session GPU worker process.
+public protocol GuestRAMProvider: AnyObject, Sendable {
+    func guestRAMView(expectedSize: UInt64) throws -> GuestRAMView
+}
+
 /// Virtio device identity. Device ID 0x7E is unassigned in the virtio 1.3 registry; PCI class
 /// 0x12/0x00 is "Processing accelerator". No guest driver binds to it — the guest never needs to.
 public enum MetalPassthroughVirtioIdentity {
@@ -39,7 +52,7 @@ public enum MetalPassthroughVirtioIdentity {
 
 @available(macOS 27.0, *)
 public final class GuestMemoryDevice: NSObject, VZCustomVirtioDeviceConfigurationDelegate, VZCustomVirtioDeviceDelegate,
-    @unchecked Sendable
+    GuestRAMProvider, @unchecked Sendable
 {
     public let queue = DispatchQueue(label: "dev.metalpassthrough.virtio")
     private let lock = NSLock()
@@ -101,6 +114,11 @@ public final class GuestMemoryDevice: NSObject, VZCustomVirtioDeviceConfiguratio
         guard let (base, mapping) = found else { throw GuestMemoryError.ramNotFound }
         lock.withLock { self.ram = (base, mapping) }
         return (base, mapping)
+    }
+
+    public func guestRAMView(expectedSize: UInt64) throws -> GuestRAMView {
+        let r = try guestRAM(expectedSize: expectedSize)
+        return GuestRAMView(base: r.base, bytes: r.mapping.mutableBytes, length: r.mapping.length)
     }
 
     /// Host virtual address of a guest physical address.

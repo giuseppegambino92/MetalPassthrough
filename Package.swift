@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "MetalPassthroughHost", targets: ["MetalPassthroughHost"]),
         .executable(name: "mpt-run", targets: ["mpt-run"]),
         .executable(name: "mpt-bench", targets: ["mpt-bench"]),
+        .executable(name: "mpt-gpu-worker", targets: ["mpt-gpu-worker"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/containerization.git", exact: "0.54.0"),
@@ -31,6 +32,10 @@ let package = Package(
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
+        ),
+        .executableTarget(
+            name: "mpt-gpu-worker",
+            dependencies: ["MetalPassthroughHost"]
         ),
         .executableTarget(
             name: "mpt-bench",

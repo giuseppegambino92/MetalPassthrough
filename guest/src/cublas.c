@@ -11,6 +11,18 @@
  *   Level 1: cublasSaxpy, cublasSscal, cublasScopy, cublasSdot, cublasSnrm2 -> Metal kernels
  *   Not provided: cuBLASLt, complex and fp64 BLAS, most level-2/3 routines (TRSM, SYRK, ...).
  *
+ * Configuration calls, and what they do here:
+ *   cublasSetMathMode: validated (unknown modes -> CUBLAS_STATUS_INVALID_VALUE) and stored. It never
+ *     changes a result: this implementation takes no reduced-precision shortcut (fp32 GEMM is never
+ *     run as TF32, fp32-compute GEMMs accumulate in fp32), which is exactly what
+ *     CUBLAS_PEDANTIC_MATH / CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION require and what the
+ *     default and TF32 modes permit. Only an explicit fp16 compute type (Hgemm, CUBLAS_COMPUTE_16F)
+ *     accumulates in fp16, as the API defines.
+ *   cublasSetWorkspace: validated like cuBLAS (256-byte aligned device memory, or NULL with size 0)
+ *     and stored, but never written: GEMM staging uses host-private Metal memory instead.
+ *   Level 1: positive increments only (negative/zero -> CUBLAS_STATUS_NOT_SUPPORTED). Snrm2 sums
+ *     squares in fp32 without the reference BLAS rescaling, so it overflows for |x| > ~1.8e19.
+ *
  * All work is ordered on the handle's stream (cublasSetStream). Device pointers are MetalPassthrough
  * device addresses (equal to guest pointers under UVA).
  *
@@ -34,6 +46,8 @@ struct cublasContext {
     cudaStream_t stream;
     cublasPointerMode_t pmode;
     cublasMath_t math;
+    void *workspace;
+    size_t workspace_bytes;
     mpt_pipeline axpy, scal, copy, dot_partial, reduce_final;
     float *scratch;  /* 256 partial sums + result, arena memory */
 };
@@ -42,17 +56,17 @@ static const char *KERNELS =
     "#include <metal_stdlib>\nusing namespace metal;\n"
     "kernel void axpy(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant float& a [[buffer(2)]],\n"
     "                 constant int2& inc [[buffer(3)]], constant uint& n [[buffer(4)]], uint i [[thread_position_in_grid]]) {\n"
-    "  if (i < n) y[i * inc.y] = fma(a, x[i * inc.x], y[i * inc.y]); }\n"
+    "  if (i < n) y[ulong(i) * ulong(inc.y)] = fma(a, x[ulong(i) * ulong(inc.x)], y[ulong(i) * ulong(inc.y)]); }\n"
     "kernel void scal(device float* x [[buffer(0)]], constant float& a [[buffer(1)]], constant int& inc [[buffer(2)]],\n"
-    "                 constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < n) x[i * inc] *= a; }\n"
+    "                 constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < n) x[ulong(i) * ulong(inc)] *= a; }\n"
     "kernel void copy(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant int2& inc [[buffer(2)]],\n"
-    "                 constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < n) y[i * inc.y] = x[i * inc.x]; }\n"
+    "                 constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < n) y[ulong(i) * ulong(inc.y)] = x[ulong(i) * ulong(inc.x)]; }\n"
     "kernel void dot_partial(device const float* x [[buffer(0)]], device const float* y [[buffer(1)]], device float* part [[buffer(2)]],\n"
     "                 constant int2& inc [[buffer(3)]], constant uint& n [[buffer(4)]], threadgroup float* sh [[threadgroup(0)]],\n"
     "                 uint t [[thread_index_in_threadgroup]], uint g [[threadgroup_position_in_grid]],\n"
     "                 uint tpg [[threads_per_threadgroup]], uint ng [[threadgroups_per_grid]]) {\n"
     "  float acc = 0.0f;\n"
-    "  for (uint i = g * tpg + t; i < n; i += tpg * ng) acc = fma(x[i * inc.x], y[i * inc.y], acc);\n"
+    "  for (uint i = g * tpg + t; i < n; i += tpg * ng) acc = fma(x[ulong(i) * ulong(inc.x)], y[ulong(i) * ulong(inc.y)], acc);\n"
     "  sh[t] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "  for (uint s = tpg / 2; s > 0; s >>= 1) { if (t < s) sh[t] += sh[t + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
     "  if (t == 0) part[g] = sh[0]; }\n"
@@ -76,12 +90,23 @@ static cublasStatus_t st(int r) {
     }
 }
 
-/* Device vector of n elements with stride inc -> guest pointer (validated), or NULL. */
+/* Device vector of n elements with stride inc -> guest pointer (validated), or NULL. The extent
+ * ((n - 1) * inc + 1) * sizeof(float) is computed with explicit overflow checks: a wrapped size
+ * would otherwise pass the range check. */
 static void *dvec(cublasHandle_t h, const void *dev, int n, int inc) {
+    if (!h || n < 0 || inc <= 0) return NULL;
     void *p = mpt_hostptr(h->ctx, (uint64_t)(uintptr_t)dev);
-    if (!p || n < 0 || inc <= 0) return NULL;
-    size_t span = n ? ((size_t)(n - 1) * (size_t)inc + 1) * sizeof(float) : sizeof(float);
-    return mpt_check_range(h->ctx, p, span) == 0 ? p : NULL;
+    if (!p) return NULL;
+    size_t elems = 1, bytes;
+    if (n > 0 && (__builtin_mul_overflow((size_t)(n - 1), (size_t)inc, &elems) || __builtin_add_overflow(elems, (size_t)1, &elems)))
+        return NULL;
+    if (__builtin_mul_overflow(elems, sizeof(float), &bytes)) return NULL;
+    return mpt_check_range(h->ctx, p, bytes) == 0 ? p : NULL;
+}
+
+/* cuBLAS returns NOT_SUPPORTED for increments it cannot handle; distinguish that from bad pointers. */
+static cublasStatus_t vec_status(int inc1, int inc2) {
+    return inc1 <= 0 || inc2 <= 0 ? CUBLAS_STATUS_NOT_SUPPORTED : CUBLAS_STATUS_INVALID_VALUE;
 }
 
 static float scalar(cublasHandle_t h, const float *v) {
@@ -128,9 +153,33 @@ EXPORT cublasStatus_t cublasSetStream(cublasHandle_t h, cudaStream_t s) { if (!h
 EXPORT cublasStatus_t cublasGetStream(cublasHandle_t h, cudaStream_t *s) { *s = h->stream; return CUBLAS_STATUS_SUCCESS; }
 EXPORT cublasStatus_t cublasSetPointerMode(cublasHandle_t h, cublasPointerMode_t m) { h->pmode = m; return CUBLAS_STATUS_SUCCESS; }
 EXPORT cublasStatus_t cublasGetPointerMode(cublasHandle_t h, cublasPointerMode_t *m) { *m = h->pmode; return CUBLAS_STATUS_SUCCESS; }
-EXPORT cublasStatus_t cublasSetMathMode(cublasHandle_t h, cublasMath_t m) { h->math = m; return CUBLAS_STATUS_SUCCESS; }
-EXPORT cublasStatus_t cublasGetMathMode(cublasHandle_t h, cublasMath_t *m) { *m = h->math; return CUBLAS_STATUS_SUCCESS; }
-EXPORT cublasStatus_t cublasSetWorkspace(cublasHandle_t h, void *w, size_t n) { return CUBLAS_STATUS_SUCCESS; }
+/* See the header comment: validated and stored; results never depend on it (no reduced precision). */
+EXPORT cublasStatus_t cublasSetMathMode(cublasHandle_t h, cublasMath_t m) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    unsigned base = (unsigned)m & ~(unsigned)CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION;
+    if (base != CUBLAS_DEFAULT_MATH && base != CUBLAS_TENSOR_OP_MATH && base != CUBLAS_PEDANTIC_MATH && base != CUBLAS_TF32_TENSOR_OP_MATH)
+        return CUBLAS_STATUS_INVALID_VALUE;
+    h->math = m;
+    return CUBLAS_STATUS_SUCCESS;
+}
+EXPORT cublasStatus_t cublasGetMathMode(cublasHandle_t h, cublasMath_t *m) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (!m) return CUBLAS_STATUS_INVALID_VALUE;
+    *m = h->math;
+    return CUBLAS_STATUS_SUCCESS;
+}
+/* Validated like cuBLAS and remembered, never written (see the header comment). */
+EXPORT cublasStatus_t cublasSetWorkspace(cublasHandle_t h, void *w, size_t n) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (!w && n) return CUBLAS_STATUS_INVALID_VALUE;
+    if (w) {
+        void *p = mpt_hostptr(h->ctx, (uint64_t)(uintptr_t)w);
+        if ((uintptr_t)w % 256 || !p || mpt_check_range(h->ctx, p, n ? n : 1)) return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    h->workspace = w;
+    h->workspace_bytes = n;
+    return CUBLAS_STATUS_SUCCESS;
+}
 
 EXPORT const char *cublasGetStatusName(cublasStatus_t s) {
     switch (s) {
@@ -355,7 +404,7 @@ static int launch(cublasHandle_t h, mpt_pipeline *p, uint32_t n, mpt_arg *args, 
 EXPORT cublasStatus_t cublasSaxpy(cublasHandle_t h, int n, const float *alpha, const float *x, int incx, float *y, int incy) {
     if (n <= 0) return CUBLAS_STATUS_SUCCESS;
     void *px = dvec(h, x, n, incx), *py = dvec(h, y, n, incy);
-    if (!px || !py) return incx <= 0 || incy <= 0 ? CUBLAS_STATUS_NOT_SUPPORTED : CUBLAS_STATUS_INVALID_VALUE;
+    if (!px || !py) return vec_status(incx, incy);
     float a = scalar(h, alpha);
     int inc[2] = { incx, incy };
     uint32_t nn = (uint32_t)n;
@@ -367,7 +416,7 @@ EXPORT cublasStatus_t cublasSaxpy(cublasHandle_t h, int n, const float *alpha, c
 EXPORT cublasStatus_t cublasSscal(cublasHandle_t h, int n, const float *alpha, float *x, int incx) {
     if (n <= 0) return CUBLAS_STATUS_SUCCESS;
     void *px = dvec(h, x, n, incx);
-    if (!px) return CUBLAS_STATUS_INVALID_VALUE;
+    if (!px) return vec_status(incx, incx);
     float a = scalar(h, alpha);
     uint32_t nn = (uint32_t)n;
     mpt_arg args[] = { { MPT_BIND_BUFFER, 0, px, 0 }, { MPT_BIND_BYTES, 1, &a, 4 }, { MPT_BIND_BYTES, 2, &incx, 4 }, { MPT_BIND_BYTES, 3, &nn, 4 } };
@@ -377,7 +426,7 @@ EXPORT cublasStatus_t cublasSscal(cublasHandle_t h, int n, const float *alpha, f
 EXPORT cublasStatus_t cublasScopy(cublasHandle_t h, int n, const float *x, int incx, float *y, int incy) {
     if (n <= 0) return CUBLAS_STATUS_SUCCESS;
     void *px = dvec(h, x, n, incx), *py = dvec(h, y, n, incy);
-    if (!px || !py) return CUBLAS_STATUS_INVALID_VALUE;
+    if (!px || !py) return vec_status(incx, incy);
     int inc[2] = { incx, incy };
     uint32_t nn = (uint32_t)n;
     mpt_arg args[] = { { MPT_BIND_BUFFER, 0, px, 0 }, { MPT_BIND_BUFFER, 1, py, 0 }, { MPT_BIND_BYTES, 2, inc, 8 }, { MPT_BIND_BYTES, 3, &nn, 4 } };
@@ -398,7 +447,7 @@ static cublasStatus_t reduce(cublasHandle_t h, int n, const float *x, int incx, 
         return CUBLAS_STATUS_SUCCESS;
     }
     void *px = dvec(h, x, n, incx), *py = dvec(h, y, n, incy);
-    if (!px || !py) return CUBLAS_STATUS_INVALID_VALUE;
+    if (!px || !py) return vec_status(incx, incy);
     int inc[2] = { incx, incy };
     uint32_t nn = (uint32_t)n, np = NPART, sq = (uint32_t)do_sqrt;
     mpt_arg a1[] = { { MPT_BIND_BUFFER, 0, px, 0 }, { MPT_BIND_BUFFER, 1, py, 0 }, { MPT_BIND_BUFFER, 2, h->scratch, 0 },

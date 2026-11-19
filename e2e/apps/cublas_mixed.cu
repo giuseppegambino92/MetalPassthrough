@@ -175,6 +175,93 @@ int main() {
                cublasGetStatusName(s3), ok ? "ok" : "FAIL");
         cudaFree(d);
     }
+    {   // Math modes: validated, and results never depend on them (no reduced-precision shortcuts).
+        const int M = 96, N = 80, K = 300;
+        Mat A(CUDA_R_32F, M, K, M), B(CUDA_R_32F, K, N, K), C(CUDA_R_32F, M, N, M);
+        cublasMath_t modes[] = { CUBLAS_DEFAULT_MATH, CUBLAS_PEDANTIC_MATH, CUBLAS_TF32_TENSOR_OP_MATH, CUBLAS_TENSOR_OP_MATH,
+                                 (cublasMath_t)(CUBLAS_DEFAULT_MATH | CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION) };
+        std::vector<float> ref((size_t)M * N), out((size_t)M * N);
+        bool same = true, set_ok = true;
+        for (int i = 0; i < 5; i++) {
+            cublasMath_t got;
+            set_ok &= cublasSetMathMode(h, modes[i]) == CUBLAS_STATUS_SUCCESS && cublasGetMathMode(h, &got) == CUBLAS_STATUS_SUCCESS && got == modes[i];
+            float one = 1, zero = 0;
+            CB(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &one, (const float *)A.d, M, (const float *)B.d, K, &zero, (float *)C.d, M));
+            CK(cudaMemcpy((i ? out : ref).data(), C.d, (size_t)M * N * 4, cudaMemcpyDeviceToHost));
+            if (i) same &= !memcmp(out.data(), ref.data(), out.size() * 4);
+        }
+        bool bad_rejected = cublasSetMathMode(h, (cublasMath_t)77) == CUBLAS_STATUS_INVALID_VALUE;
+        CB(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH));
+        double worst = 0;  // full fp32 accuracy (TF32 would be ~1e-3 relative here)
+        for (int j = 0; j < N; j++)
+            for (int i = 0; i < M; i++) {
+                double acc = 0;
+                for (int p2 = 0; p2 < K; p2++) acc += A.at(0, i, p2) * B.at(0, p2, j);
+                worst = fmax(worst, fabs(acc - ref[(size_t)j * M + i]));
+            }
+        bool ok = set_ok && same && bad_rejected && worst < 1e-5;
+        fails += !ok;
+        printf("%-58s set/get %s, bit-identical across 5 modes %s, invalid mode rejected %s, fp32 err %.1e  %s\n", "math modes", set_ok ? "ok" : "BAD",
+               same ? "yes" : "NO", bad_rejected ? "yes" : "NO", worst, ok ? "ok" : "FAIL");
+    }
+    {   // Workspace: validated like cuBLAS, never written.
+        uint8_t *ws;
+        CK(cudaMalloc(&ws, 1 << 20));
+        CK(cudaMemset(ws, 0x5A, 1 << 20));
+        char host_buf[512];
+        cublasStatus_t s_null = cublasSetWorkspace(h, nullptr, 0), s_null_size = cublasSetWorkspace(h, nullptr, 64),
+                       s_misaligned = cublasSetWorkspace(h, ws + 8, 4096), s_host = cublasSetWorkspace(h, host_buf, 256),
+                       s_too_big = cublasSetWorkspace(h, ws, (2 << 20)), s_ok = cublasSetWorkspace(h, ws, 1 << 20);
+        Mat A(CUDA_R_16BF, 64, 64, 64), B(CUDA_R_16BF, 64, 64, 64), C(CUDA_R_16BF, 64, 64, 64);  // staged path
+        float one = 1, zero = 0;
+        CB(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, 64, 64, 64, &one, A.d, CUDA_R_16BF, 64, B.d, CUDA_R_16BF, 64, &zero, C.d, CUDA_R_16BF, 64,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        std::vector<uint8_t> back(1 << 20);
+        CK(cudaMemcpy(back.data(), ws, back.size(), cudaMemcpyDeviceToHost));
+        size_t touched = 0;
+        for (uint8_t b : back) touched += b != 0x5A;
+        bool ok = s_null == CUBLAS_STATUS_SUCCESS && s_null_size == CUBLAS_STATUS_INVALID_VALUE && s_misaligned == CUBLAS_STATUS_INVALID_VALUE &&
+                  s_host == CUBLAS_STATUS_INVALID_VALUE && s_too_big == CUBLAS_STATUS_INVALID_VALUE && s_ok == CUBLAS_STATUS_SUCCESS && !touched;
+        fails += !ok;
+        printf("%-58s NULL/0 %s, NULL/64 %s, misaligned %s, host ptr %s, past end %s, valid %s; bytes written: %zu  %s\n", "cublasSetWorkspace",
+               cublasGetStatusName(s_null) + 14, cublasGetStatusName(s_null_size) + 14, cublasGetStatusName(s_misaligned) + 14,
+               cublasGetStatusName(s_host) + 14, cublasGetStatusName(s_too_big) + 14, cublasGetStatusName(s_ok) + 14, touched, ok ? "ok" : "FAIL");
+        CB(cublasSetWorkspace(h, nullptr, 0));
+        cudaFree(ws);
+    }
+    {   // Level 1: strides, size overflow, unsupported increments.
+        const int n = 1000, inc = 3;
+        float *x, *y;
+        CK(cudaMalloc(&x, (size_t)n * inc * 4)); CK(cudaMalloc(&y, (size_t)n * inc * 4));
+        std::vector<float> hx((size_t)n * inc), hy((size_t)n * inc);
+        for (size_t i = 0; i < hx.size(); i++) { hx[i] = frand(); hy[i] = frand(); }
+        CK(cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(y, hy.data(), hy.size() * 4, cudaMemcpyHostToDevice));
+        float a = 0.75f, dot = 0;
+        CB(cublasSaxpy(h, n, &a, x, inc, y, inc));
+        CB(cublasSdot(h, n, x, inc, y, inc, &dot));
+        std::vector<float> gy(hy.size());
+        CK(cudaMemcpy(gy.data(), y, gy.size() * 4, cudaMemcpyDeviceToHost));
+        double ax = 0, rdot = 0;
+        size_t untouched_bad = 0;
+        for (int i = 0; i < n * inc; i++) {
+            if (i % inc == 0) { double r = (double)a * hx[i] + hy[i]; ax = fmax(ax, fabs(gy[i] - r)); rdot += (double)hx[i] * r; }
+            else untouched_bad += gy[i] != hy[i];  // elements between strides must not change
+        }
+        const int big = 2147483647;  // (n-1)*inc*4 exceeds 2^64 only with these combined; each must be rejected cleanly
+        cublasStatus_t o1 = cublasSaxpy(h, big, &a, x, big, y, 1), o2 = cublasScopy(h, 5, x, 1 << 30, y, 1),
+                       o3 = cublasSdot(h, big, x, big, y, big, &dot), o4 = cublasSscal(h, big, &a, x, big);
+        cublasStatus_t neg = cublasSaxpy(h, n, &a, x, -1, y, 1), neg2 = cublasScopy(h, n, x, 1, y, -2), zero_inc = cublasSscal(h, n, &a, x, 0);
+        bool ok = ax < 1e-6 && fabs(dot - rdot) < 1e-3 * fmax(1.0, fabs(rdot)) && !untouched_bad && o1 == CUBLAS_STATUS_INVALID_VALUE &&
+                  o2 == CUBLAS_STATUS_INVALID_VALUE && o3 == CUBLAS_STATUS_INVALID_VALUE && o4 == CUBLAS_STATUS_INVALID_VALUE &&
+                  neg == CUBLAS_STATUS_NOT_SUPPORTED && neg2 == CUBLAS_STATUS_NOT_SUPPORTED && zero_inc == CUBLAS_STATUS_NOT_SUPPORTED;
+        fails += !ok;
+        printf("%-58s axpy err %.1e, dot err %.1e, gaps untouched %s; huge n*inc rejected %s; negative/zero inc -> %s  %s\n",
+               "level 1 with stride 3, overflow and increments", ax, fabs(dot - rdot), untouched_bad ? "NO" : "yes",
+               o1 == CUBLAS_STATUS_INVALID_VALUE && o2 == CUBLAS_STATUS_INVALID_VALUE && o3 == CUBLAS_STATUS_INVALID_VALUE && o4 == CUBLAS_STATUS_INVALID_VALUE ? "yes" : "NO",
+               cublasGetStatusName(neg) + 14, ok ? "ok" : "FAIL");
+        cudaFree(x); cudaFree(y);
+    }
     // Throughput (4096^3).
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));

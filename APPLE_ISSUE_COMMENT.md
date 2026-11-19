@@ -63,9 +63,9 @@ references):
 against that VM's own memory; a protocol fuzzer (random commands, malformed handshakes, corrupted
 ring indices, GEMM descriptors aimed at MPS's process-aborting assertions) runs against the real
 host. A process killed mid-kernel cannot have its pages recycled before the GPU drains (stress-tested
-with every word checked). Each VM's GPU work runs in that VM's own host process, so a shader with a
-forged pointer cannot reach another container (tested); processes *within* one container share a
-GPU address space. A guest *can* keep the GPU busy with a non-terminating kernel, since Metal
+with every word checked). Each guest process's GPU work runs in its own host worker process (guest RAM shared in
+as a Mach memory entry), so a shader with a forged pointer cannot reach another process or another
+container (both tested), and a Metal or MPS failure ends only that session. A guest *can* keep the GPU busy with a non-terminating kernel, since Metal
 offers no preemption for that.
 
 **Limits.** This is compute only, with no graphics or Vulkan. It needs PTX, not SASS. There are

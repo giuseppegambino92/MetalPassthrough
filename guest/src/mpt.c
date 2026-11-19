@@ -787,6 +787,7 @@ MPT_API size_t mpt_abi_sizeof(const char *type) {
     return 0;
 }
 MPT_API int mpt_unified_addressing(mpt_ctx *c) { return c->uva; }
+MPT_API uint64_t mpt_session_caps(mpt_ctx *c) { return c->caps; }
 MPT_API int mpt_crash_safe(mpt_ctx *c) { return c->keeper >= 0; }
 
 /* Test/fuzzing hooks: submit an arbitrary SQE (waits for its CQE unless MPT_F_NO_CQE), and expose

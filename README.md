@@ -51,11 +51,12 @@ inside a real Linux VM. Nothing is simulated.
 | **CUDA Driver API** | `libcuda.so.1`, compiled against NVIDIA's own `cuda.h` (93 entry points): `cuInit` → `cuMemAlloc` → `cuModuleLoadData(ptx)` → `cuLaunchKernel` → `cuCtxSynchronize`, managed and pinned memory. |
 | **CUDA streams and events** | Real streams (one Metal queue each) that **run concurrently**: 2 and 4 independent low-occupancy kernels finish in 1.02–1.04× the time of one. CUDA's legacy default-stream rules and `CU_STREAM_NON_BLOCKING`; `cuStreamWaitEvent` is a GPU-side dependency (`MTLSharedEvent`); `cuStreamQuery`/`cuEventQuery` never block; asynchronous copies and memsets are stream-ordered; every copy and memset is range-checked against its allocation. |
 | **CUDA Runtime API** | `libcudart.so.12` (58 entry points). Executables built with stock `nvcc -cudart shared` run unmodified: fatbinary registration, `<<<grid, block>>>`, templates, `__shared__`, atomics. |
-| **cuBLAS** | `libcublas.so.12` against NVIDIA's `cublas_v2.h`, 27 entry points. GEMM runs Apple's `MPSMatrixMultiplication` in place on container memory (fp32 up to **8.7 TFLOP/s**): `Sgemm`, `Hgemm`, `GemmEx` with fp32/fp16/bf16 inputs and outputs and fp32 or fp16 compute, strided-batched (any stride, including 0) and pointer-array batched variants, `Sgemv`, and level-1 `Saxpy/Sscal/Scopy/Sdot/Snrm2`. Not included: cuBLASLt, cuDNN, fp64/complex BLAS, most level-2/3 routines. |
+| **cuBLAS** | `libcublas.so.12` against NVIDIA's `cublas_v2.h`, 27 entry points. `cublasSetMathMode` and `cublasSetWorkspace` are validated, and their exact effect is documented in [`guest/src/cublas.c`](guest/src/cublas.c): no reduced-precision shortcut is ever taken, and the workspace is never written. GEMM runs Apple's `MPSMatrixMultiplication` in place on container memory (fp32 up to **8.7 TFLOP/s**): `Sgemm`, `Hgemm`, `GemmEx` with fp32/fp16/bf16 inputs and outputs and fp32 or fp16 compute, strided-batched (any stride, including 0) and pointer-array batched variants, `Sgemv`, and level-1 `Saxpy/Sscal/Scopy/Sdot/Snrm2`. Not included: cuBLASLt, cuDNN, fp64/complex BLAS, most level-2/3 routines. |
 | **Triton** | PTX produced by Triton 3.5 (compiled AOT on a Mac, no NVIDIA GPU) loads and runs: `add` and a row softmax are verified in CI. |
 | **PTX → Metal JIT** | A translator for nvcc-generated PTX (ISA 9.x): integer/float/bit ops, shared/local/generic memory, atomics, warp shuffles/votes, barriers with SIMT-correct reconvergence, and df64 FP64 emulation. |
 | **Python** | `import metalpassthrough`: zero-copy NumPy arrays, DLPack / `torch.from_dlpack` views, `@metal_kernel` and `@ptx_kernel` decorators, `mpt.matmul` (MPS GEMM). |
 | **Crash-safe teardown** | A SIGKILLed process cannot have its pages recycled while its GPU work still runs: arenas are hugetlb memfds held by a detached keeper process that the host releases only after the GPU drained (stress test: 15 rounds of random SIGKILLs of 3 GPU processes, from mid-handshake to mid-kernel, then every word of the whole hugepage pool checked: 0 foreign writes and 0 leaked pages, against 16–19 million corrupted words per round with the keeper disabled). |
+| **Per-process GPU isolation** | Every guest process's GPU work runs in its own host process (`mpt-gpu-worker`), so shaders with forged pointers cannot reach other processes of the same container (measured and asserted), and a crashing worker takes down only its own session. |
 | **Hostile-guest hardening** | Every descriptor is copied before validation, sizes are overflow-checked, ring violations end only the offending session. A protocol fuzzer (random SQEs, malformed handshakes, garbage shaders, corrupted ring indices, GEMM descriptors aimed at Metal Performance Shaders' process-aborting assertions) and a PTX mutation fuzzer run against the real host. |
 | **`apple-smi`** | An `nvidia-smi` for the Apple GPU from inside Linux. It shows live GPU, memory, pipeline-cache, latency and per-process data. |
 | **apple/container integration** | A runtime plugin for the **stock** CLI (`--runtime container-runtime-metalpassthrough`), or a 49-line patch that adds `container run --gpu`, or the standalone `mpt-run`. |
@@ -69,7 +70,9 @@ system noise hits both equally, and reports medians. *GPU* time comes from comma
 timestamps. *Wall* time runs from the API call until the result is visible to the calling CPU,
 which for the guest means inside the VM. Full table and raw CSV:
 [`bench/results/RESULTS.md`](bench/results/RESULTS.md). Measured on an M3 Max, macOS 27.2.1,
-5 rounds × 7 repetitions.
+5 rounds × 7 repetitions, on an idle machine, before sessions moved into per-process GPU workers.
+The ring and GPU path measured here did not change; the only added cost, at session open, is in
+[Isolation](#isolation-one-gpu-address-space-per-guest-process).
 
 | Kernel | Size | Native | Linux guest | Guest / native (GPU time) | Wall-clock overhead |
 |---|---|---:|---:|---:|---:|
@@ -331,8 +334,8 @@ MetalPassthrough is a working system, not a full CUDA implementation. Know its e
   GPU VA placement. The host verifies it and advertises it as a capability; when it cannot be
   arranged (or `METALPASSTHROUGH_NO_UVA=1` on the host) the runtime falls back to translated
   addresses, and the CUDA test suite passes in both modes.
-- **Isolation: the security boundary is the VM, not the process.** See
-  [What a shader can reach](#isolation-what-a-shader-can-reach-measured) below.
+- **Isolation boundary: the guest process.** Each one gets its own host GPU process and GPU
+  address space. See [Isolation](#isolation-one-gpu-address-space-per-guest-process) below.
 - **GPU time is not partitioned.** A guest can submit a kernel that never terminates and monopolize
   the Apple GPU (the host caps a dispatch at 2^40 threads, but cannot bound loop trip counts). macOS
   has no GPU preemption API for that; the session can be killed, the kernel cannot.
@@ -348,31 +351,54 @@ MetalPassthrough is a working system, not a full CUDA implementation. Know its e
 - **macOS 27+ only.** On older systems the plugin and `--gpu` return an unsupported error, and
   nothing changes for other containers.
 
-### Isolation: what a shader can reach (measured)
+### Isolation: one GPU address space per guest process
 
 The host validates every address it is *given* (descriptors, bindings, copies, GEMM operands).
 A shader, however, is arbitrary code that can build any 64-bit pointer, and Apple GPUs have no
 bounds checking for device pointers. What such a pointer reaches is decided by the GPU address
-space it runs in, which is per **host process**. MetalPassthrough runs one GPU service process per
-VM: `mpt-run`, or the runtime helper of an apple/container container. `e2e/robustness/isolation.c`
-probes this directly with a kernel that loads and stores through arbitrary addresses:
+space it runs in, and macOS gives every **host process** its own.
 
-| Target of a wild-pointer shader | Result |
-|---|---|
-| Its own allocations | read/write (expected) |
-| **Another VM** (= another container): a live allocation's exact address | **unreachable**: the address resolves to the prober's own memory, and the victim sees 0 modified words. Asserted in `make test-all`. |
-| **Another process in the same VM** (same container) | **readable and writable** |
-| Unmapped GPU addresses | loads return 0 and stores are dropped. No fault is reported, and host and session are unaffected. |
+So each guest process's session runs in its own host process, `mpt-gpu-worker`:
+- The VM-owning process (`mpt-run`, or the container's runtime helper) keeps the VM, the vsock
+  endpoint, the keeper and the session table. For every guest process that opens a session, it
+  hands a worker the session socket and two Mach memory entries: guest RAM and the session table.
+- The worker maps exactly that session's arenas into Metal and nothing else: no other session's
+  memory and no other session's socket (only fds 0-3 are passed).
+- A spare worker is kept pre-started (Metal device created, caches loaded), so a new process does
+  not wait for `MTLCreateSystemDefaultDevice` (~30-80 ms).
+- `METALPASSTHROUGH_ISOLATION=shared` on the host restores the earlier model: one GPU process per
+  VM, slightly faster session start, no isolation between processes of one container.
 
-So containers are isolated from each other, while processes inside one container that use the
-GPU form a single trust domain, like threads sharing one CUDA context. That matches what those
-processes can usually already do to each other (same filesystem, often the same uid and ptrace),
-but it does bypass uid separation *inside* a container. For untrusted multi-tenant work, give each
-tenant its own container. Two ways to close the intra-VM gap exist, neither implemented yet:
-1. a host GPU process per guest process: guest RAM is shared into it with a Mach memory entry, so
-   each process gets its own GPU address space;
-2. software bounds checks emitted by the PTX translator: every global access clamped to the
-   session's arenas. That covers CUDA but not raw MSL.
+`e2e/robustness/isolation.c` probes this with a kernel that loads and stores through arbitrary
+addresses. The victim's data deliberately sits beyond the prober's whole arena, so only a shared
+address space could reach it:
+
+| Target of a wild-pointer shader | `process` (default) | `shared` |
+|---|---|---|
+| Its own allocations | read/write | read/write |
+| **Another process in the same VM** (same container) | **unreachable**: loads return 0, stores do not land, 0 victim words modified | readable and writable |
+| **Another VM** (another container) | unreachable | unreachable |
+| Unmapped GPU addresses | loads return 0, stores dropped, no fault reported | same |
+
+`make test-all` asserts the first two rows of the default mode, and asserts that shared mode *does*
+leak, which proves the probe would notice.
+
+Two more consequences of the process boundary:
+- **Fault containment.** Anything that kills a worker, whether a Metal driver error, a Metal
+  Performance Shaders assertion or a host bug, ends only that guest process's session. The VM's
+  GPU service and the other sessions keep running, and the keeper releases the dead session's
+  pages after the worker is gone.
+- **Cost.** Dispatch latency and throughput are unchanged: the ring and the GPU path are the same.
+  Opening a session is the only added cost:
+
+| Session open (median of 5, loaded machine) | `process` | `shared` |
+|---|---:|---:|
+| 64 / 256 MiB arena, processes starting 150 ms apart | 4-6 / 11-23 ms | 3-10 / 10-26 ms |
+| 1 GiB arena | 89-129 ms | 52-113 ms |
+| 64 MiB, reopened back to back (spare still starting) | 23-32 ms | 2-7 ms |
+
+What stays shared: threads of *one* guest process share its session, as they would share a CUDA
+context. GPU time is not partitioned (see Limitations).
 
 ## Repository layout
 
@@ -388,6 +414,7 @@ Sources/MetalPassthroughHost/         Swift 6 host engine
   PipelineCache.swift               in-memory + persistent MTLBinaryArchive
   PTX/                              PTX parser, PTX→MSL code generator, MSL runtime prelude (df64, atomics…)
 Sources/mpt-run/                  standalone runner (Containerization, cached rootfs clones)
+Sources/mpt-gpu-worker/           per-session GPU worker process (isolation; logic in SessionRunner.swift)
 Sources/mpt-bench/                native-host baseline of the benchmark
 guest/                            Linux side: libmetalpassthrough.so, libcuda.so.1, libcudart.so.12, libcublas.so.12, apple-smi (Rust), Python
 Tests/MetalPassthroughHostTests/  translator tests (nvcc and Triton PTX executed on the GPU vs CPU references), PTX fuzzer

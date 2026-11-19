@@ -48,8 +48,12 @@ static void report(const char *what, uint64_t addr, int store) {
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: isolation victim <s> | probe [addr]\n"); return 2; }
-    if (mpt_open(&c, 64 << 20)) { fprintf(stderr, "%s\n", mpt_last_error()); return 1; }
-    if (!strcmp(argv[1], "victim")) {
+    int victim = !strcmp(argv[1], "victim");
+    /* The victim's data sits 160 MiB into a 256 MiB arena, beyond the prober's whole 64 MiB arena,
+     * so the victim's address can never be shadowed by the prober's own memory. */
+    if (mpt_open(&c, (victim ? 256u : 64u) << 20)) { fprintf(stderr, "%s\n", mpt_last_error()); return 1; }
+    if (victim) {
+        if (!mpt_alloc(c, 160u << 20, 0)) { fprintf(stderr, "%s\n", mpt_last_error()); return 1; }
         uint32_t *v = mpt_alloc(c, 16 << 20, 0);
         for (size_t i = 0; i < (16u << 20) / 4; i++) v[i] = 0xA5A5A5A5u;
         printf("VICTIM 0x%" PRIx64 "\n", mpt_devaddr(c, v));

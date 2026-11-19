@@ -111,6 +111,8 @@ typedef struct {
 #define MPT_CAP_UVA      0x1ull   /* arena gpu_base is 2 MiB aligned: guest may mremap to VA == gpu_base */
 #define MPT_CAP_STREAMS  0x2ull   /* independent Metal queues per stream, event waits */
 #define MPT_CAP_KEEPER   0x4ull   /* host honours keeper connections (crash-safe teardown) */
+#define MPT_CAP_PROCESS_ISOLATION 0x8ull /* this session's GPU work runs in its own host process and
+                                          * GPU address space: shaders cannot reach other sessions */
 
 /* ---- Ring header (arena 0 + 0). Each line is written by exactly one side. ---------------- */
 typedef struct MPT_ALIGNED(MPT_CACHELINE) {

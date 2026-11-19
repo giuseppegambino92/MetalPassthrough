@@ -53,6 +53,8 @@ MPT_API int mpt_ping(mpt_ctx *ctx, uint64_t *roundtrip_ns);
 MPT_API uint32_t mpt_session_id(mpt_ctx *ctx);
 /* 1 if every arena pointer is numerically equal to its device address (CUDA-style UVA). */
 MPT_API int mpt_unified_addressing(mpt_ctx *ctx);
+/* MPT_CAP_* flags the host granted this session (e.g. MPT_CAP_PROCESS_ISOLATION). */
+MPT_API uint64_t mpt_session_caps(mpt_ctx *ctx);
 /* 1 if a keeper process guarantees the arena pages outlive in-flight GPU work if this process dies. */
 MPT_API int mpt_crash_safe(mpt_ctx *ctx);
 /* sizeof() of ABI structs by name, for bindings that mirror them (ctypes, Rust FFI). */

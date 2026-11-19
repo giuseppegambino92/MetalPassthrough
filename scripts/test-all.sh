@@ -71,6 +71,24 @@ cross_vm_isolation() {
     [ -n "$A" ] && grep -q 'modified by other processes/VMs: 0$' "$OUT/iso-victim.out" && ! grep -q 'victim address.*loaded 0xa5a5a5a5' "$OUT/iso-probe.out"
 }
 step "isolation: a wild-pointer shader cannot reach another VM" robust-isolation.log cross_vm_isolation
+# Same VM, another process: its data sits beyond the prober's whole arena, so only a shared GPU
+# address space could reach it. Process isolation (default) must block it; shared mode must not
+# (that control proves the probe would see a leak).
+same_vm_isolation() {  # mode, expect-isolated
+    env METALPASSTHROUGH_ISOLATION="$1" "$MPT" --cpus 8 --memory 8192 --hugepages 2048 --runtime "$ROOT/guest/dist" -v "$ROOT/e2e:/e2e" "$RUNTIME" sh -c '
+        /e2e/robustness/isolation victim 10 > /tmp/v.out 2>&1 & V=$!
+        for i in $(seq 1 60); do A=$(sed -n "s/^VICTIM \(0x[0-9a-f]*\)$/\1/p" /tmp/v.out); [ -n "$A" ] && break; sleep 0.2; done
+        /e2e/robustness/isolation probe "$A" > /tmp/p.out 2>&1; wait $V
+        cat /tmp/p.out; grep VICTIM /tmp/v.out
+        if grep -q "modified by other processes/VMs: 0$" /tmp/v.out && ! grep -q "victim address.*loaded 0xa5a5a5a5" /tmp/p.out; then echo ISOLATED; else echo LEAKED; fi' \
+        > "$OUT/iso-$1.out" 2>&1
+    grep -v '^\[metal' "$OUT/iso-$1.out"
+    if [ "$2" = yes ]; then grep -q '^ISOLATED$' "$OUT/iso-$1.out"; else grep -q '^LEAKED$' "$OUT/iso-$1.out"; fi
+}
+step "isolation: another process in the same VM is unreachable" robust-isolation-process.log same_vm_isolation process yes
+step "isolation control: shared mode does leak (probe works)" robust-isolation-shared.log same_vm_isolation shared no
+step "shared mode (METALPASSTHROUGH_ISOLATION=shared): CUDA semantics" shared-semantics.log \
+    env METALPASSTHROUGH_ISOLATION=shared "$MPT" --cpus 8 --memory 8192 --hugepages 2048 --runtime "$ROOT/guest/dist" -v "$ROOT/e2e:/e2e" "$RUNTIME" /e2e/cuda/semantics_test
 step "multi-process: 6 concurrent GPU processes" robust-multi.log run "$RUNTIME" sh -c '
     for i in 1 2 3; do mpt-selftest > /tmp/s$i.log 2>&1 & /e2e/cuda/driver_test /e2e/cuda/kernels.ptx 256 > /tmp/d$i.log 2>&1 & done; wait
     grep -h "PASS\|FAIL" /tmp/s*.log /tmp/d*.log; [ $(grep -l PASS /tmp/s*.log /tmp/d*.log | wc -l) -eq 6 ]'
@@ -79,7 +97,7 @@ if [ -d "$(dirname "$(readlink -f "$(command -v container)")")/../libexec/contai
     echo "== stock apple/container CLI + MetalPassthrough runtime plugin (no CLI patch)"
     step "container run --runtime container-runtime-metalpassthrough" plugin.log \
         container run --rm --runtime container-runtime-metalpassthrough --memory 8g --cpus 8 -v "$ROOT/e2e:/e2e" "$RUNTIME" \
-        sh -c 'mpt-selftest && /e2e/cuda/semantics_test && /e2e/apps/cg_solver 512'
+        sh -c 'mpt-selftest && /e2e/cuda/semantics_test && /e2e/apps/cg_solver 512 && apple-smi | grep "GPU isolation: per process"'
 fi
 
 echo "== translated addressing (UVA negotiated off by the host)"
@@ -96,7 +114,7 @@ step "no-UVA: CUDA semantics" nouva-semantics.log env METALPASSTHROUGH_NO_UVA=1 
     echo "|---|---|---|"
     printf "%b\n" "$results" | sed '/^$/d'
     echo
-    for f in test1-apple-smi test2-native test3-driver test3-runtime test3-semantics test4-python apps-cublas apps-cg apps-attention apps-cublas-mixed robust-crash robust-crash-stress robust-fuzz robust-isolation robust-multi plugin selftest nouva-driver; do
+    for f in test1-apple-smi test2-native test3-driver test3-runtime test3-semantics test4-python apps-cublas apps-cg apps-attention apps-cublas-mixed robust-crash robust-crash-stress robust-fuzz robust-isolation robust-isolation-process robust-isolation-shared shared-semantics robust-multi plugin selftest nouva-driver; do
         [ -f "$OUT/$f.log" ] || continue; echo "## $f"; echo; echo '```'; grep -v '^\[metalpassthrough' "$OUT/$f.log" | tail -40; echo '```'; echo
     done
 } > "$OUT/summary.md"

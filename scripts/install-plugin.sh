@@ -44,6 +44,9 @@ if ! grep -q MetalPassthroughAttachment vendor/container/Sources/Services/Runtim
 fi
 
 make guest >/dev/null
+# Per-session GPU worker (process isolation): built from this package, installed next to the helper.
+swift build -c release --product mpt-gpu-worker
+WORKER="$(swift build -c release --show-bin-path)/mpt-gpu-worker"
 (cd vendor/container && METALPASSTHROUGH_PATH="$ROOT" swift build -c release --product container-runtime-linux)
 BIN="$(cd vendor/container && swift build -c release --show-bin-path)/container-runtime-linux"
 
@@ -51,6 +54,8 @@ rm -rf "$DEST"
 mkdir -p "$DEST/bin" "$DEST/share/metalpassthrough"
 cp "$BIN" "$DEST/bin/$NAME"
 codesign --force --sign - --entitlements signing/mpt.entitlements "$DEST/bin/$NAME"
+cp "$WORKER" "$DEST/bin/mpt-gpu-worker"
+codesign --force --sign - "$DEST/bin/mpt-gpu-worker"   # needs no entitlement: Metal only
 cp -R guest/dist "$DEST/share/metalpassthrough/guest"
 cat > "$DEST/config.toml" <<TOML
 abstract = "Linux container runtime with MetalPassthrough zero-copy Apple GPU access"
